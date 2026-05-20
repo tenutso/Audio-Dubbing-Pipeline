@@ -55,8 +55,10 @@ whisper:
 translation:
   # EuroLLM-9B-Instruct — runs on-GPU via HuggingFace transformers
   eurollm_model: utter-project/EuroLLM-9B-Instruct
-  # 8-bit quantization: ~9 GB VRAM vs ~18 GB in bfloat16
-  # Set false if you have headroom and want maximum quality
+  # 8-bit quantization: ~9 GB VRAM vs ~18 GB in bfloat16.
+  # NOTE: 8-bit is also 2-3× SLOWER than bfloat16 on RTX 4090.
+  # On a 24 GB 4090 with nothing else loaded during translation, bf16 fits
+  # comfortably — set this to false for a major translation speedup.
   eurollm_quantize: true
   # HuggingFace token — required for EuroLLM-9B-Instruct (gated model).
   # Get yours at https://huggingface.co/settings/tokens after requesting

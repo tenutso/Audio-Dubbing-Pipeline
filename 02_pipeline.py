@@ -616,7 +616,7 @@ def _llm_generate(
     tokenizer,
     prompt: str,
     temperature: float,
-    max_new_tokens: int = 2048,
+    max_new_tokens: int = 1024,
 ) -> str:
     """Single chat-template generation. Returns the decoded assistant response."""
     messages = [{"role": "user", "content": prompt}]
@@ -633,6 +633,9 @@ def _llm_generate(
             max_new_tokens=max_new_tokens,
             temperature=temperature,
             do_sample=temperature > 0,
+            # Pass both eos and pad so the model can actually stop on EOS instead
+            # of running to max_new_tokens when it would otherwise emit EOS.
+            eos_token_id=tokenizer.eos_token_id,
             pad_token_id=tokenizer.eos_token_id,
         )
 
@@ -717,40 +720,55 @@ def translate_segments(
                 out[start + i]["text_fr"] = seg["text"]
                 out[start + i]["_budget"] = budgets[i]
 
-    # ── Pass 2: per-segment overflow retry with tighter budget ───────────────
+    # ── Pass 2: batched overflow retry with progressively tighter budgets ────
+    # Up to MAX_RETRIES sweeps; each sweep batches all still-overflowing items
+    # in groups of `batch_size` and shrinks every remaining budget by 30%.
     OVERFLOW_FACTOR = 1.4
     MAX_RETRIES = 3
-    retried = 0
-    for idx, seg in enumerate(out):
-        budget = seg.get("_budget", _budget_chars(seg, target_lang, cps_safety))
-        text_fr = seg.get("text_fr", "")
-        attempt = 0
-        budget_now = budget
-        while attempt < MAX_RETRIES and len(text_fr) > budget * OVERFLOW_FACTOR:
-            attempt += 1
-            budget_now = max(20, int(budget_now * 0.7))
-            single_prompt = _TRANSLATE_PROMPT.format(
-                language=language,
-                segments=f"1. (MAX {budget_now} chars) {seg['text']}",
-            )
-            try:
-                response = _llm_generate(llm, tokenizer, single_prompt, temperature)
-                candidates = _parse_numbered(response, 1)
-                if candidates and candidates[0]:
-                    text_fr = candidates[0]
-            except Exception as e:
-                log.debug(f"Retry {attempt} on segment {idx} failed: {e}")
-                break
-        if attempt > 0:
-            retried += 1
-            log.debug(
-                f"  segment {idx}: budget={budget}, final_len={len(text_fr)}, "
-                f"retries={attempt}"
-            )
-        out[idx]["text_fr"] = text_fr
 
-    if retried:
-        log.info(f"  Retried {retried}/{len(out)} segments for overflow")
+    def _overflow(seg: dict) -> bool:
+        budget = seg.get("_budget", _budget_chars(seg, target_lang, cps_safety))
+        return len(seg.get("text_fr", "")) > budget * OVERFLOW_FACTOR
+
+    remaining = [i for i, s in enumerate(out) if _overflow(s)]
+
+    if not remaining:
+        log.info("  No segments overflow the CPS budget — skipping retry pass")
+    else:
+        log.info(f"  {len(remaining)}/{len(out)} segments overflow — batched retry with tighter budgets")
+        # Track each segment's current (shrinking) budget across attempts.
+        budgets_now = {i: out[i].get("_budget", _budget_chars(out[i], target_lang, cps_safety)) for i in remaining}
+
+        for attempt in range(1, MAX_RETRIES + 1):
+            if not remaining:
+                break
+            for i in remaining:
+                budgets_now[i] = max(20, int(budgets_now[i] * 0.7))
+
+            for start in tqdm(
+                range(0, len(remaining), batch_size),
+                desc=f"Retry pass {attempt}/{MAX_RETRIES} ({len(remaining)} segs)",
+            ):
+                batch_ids = remaining[start : start + batch_size]
+                numbered = "\n".join(
+                    f"{k + 1}. (MAX {budgets_now[i]} chars) {out[i]['text']}"
+                    for k, i in enumerate(batch_ids)
+                )
+                prompt = _TRANSLATE_PROMPT.format(language=language, segments=numbered)
+                try:
+                    response = _llm_generate(llm, tokenizer, prompt, temperature)
+                    candidates = _parse_numbered(response, len(batch_ids))
+                    for k, i in enumerate(batch_ids):
+                        if candidates[k]:
+                            out[i]["text_fr"] = candidates[k]
+                except Exception as e:
+                    log.debug(f"Retry pass {attempt} batch starting at {start} failed: {e}")
+
+            remaining = [i for i in remaining if _overflow(out[i])]
+            log.info(f"  After retry pass {attempt}: {len(remaining)} segments still overflow")
+
+        if remaining:
+            log.info(f"  {len(remaining)} segments did not converge — natural-pass fallback will handle them")
 
     # ── Pass 3: optional natural (unconstrained) translation for SRT ─────────
     if natural_pass:

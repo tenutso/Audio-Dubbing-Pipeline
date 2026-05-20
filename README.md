@@ -1,9 +1,9 @@
-# French Dubbing Pipeline for RunPod - Complete Setup Package
+# Audio Dubbing Pipeline for RunPod - Complete Setup Package
 
 ## Overview
 
 This is a **complete, production-ready system** for converting English webinar MP4 files into:
-1. **French audio tracks** (natural spoken French with voice cloning)
+1. **French(or other) audio tracks** (natural spoken French with voice cloning)
 2. **Synchronized SRT subtitles** (French translations)
 
 Everything is **open-source, fully reproducible, and optimized for RunPod's on-demand GPU pricing**.
