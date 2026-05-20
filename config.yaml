@@ -70,6 +70,21 @@ translation:
   batch_size: 10
   review_pass: true
 
+  # Target language for the dub.  Drives the LANG_CPS budget table, the
+  # translation/review prompts, and the WhisperX alignment model.
+  # Supported: fr, es, de, it, pt, nl, pl, ru, ja, ko, zh, ar, tr, hi, vi.
+  target_lang: fr
+
+  # Multiplier on the per-segment character budget (1.1 = +10% headroom).
+  # Raise toward 1.2 if the dub feels too terse; lower toward 1.0 if French
+  # still races.  Effective budget = duration_s × LANG_CPS[lang] × cps_safety.
+  cps_safety: 1.1
+
+  # Run a second, unconstrained translation pass for SRT readability.
+  # Doubles EuroLLM cost but produces nicer-reading subtitles (the length-fitted
+  # text used for audio is sometimes terse to the point of being unnatural).
+  natural_pass: true
+
 # ============================================================
 # Text-to-Speech — VoxCPM2
 # 2B diffusion autoregressive model, 48 kHz output, 30 languages.
@@ -91,10 +106,11 @@ tts:
   # Removes room noise / reverb before it reaches the voice cloner.
   use_deepfilter: true
 
-  # Max atempo ratio for segments that still overflow after VoxCPM2 synthesis.
-  # French is ~20% longer than English; VoxCPM2 handles most of this via its
-  # internal duration model.  Keep ≤ 1.2 — higher values sound degraded.
-  max_stretch: 1.15
+  # Max atempo ratio for segments that still overflow after the LLM has already
+  # been told to fit a CPS-budgeted translation.  Should rarely trigger now that
+  # translation is length-aware.  Beyond this ratio we truncate with an 80 ms
+  # fade-out instead of speeding up further (preserves voice quality).
+  max_stretch: 1.10
 
   # VoxCPM2 inference quality knobs.
   # cfg_value: LM guidance strength.  Higher = better adherence to prompt voice
@@ -127,6 +143,10 @@ subtitles:
   # Shift all subtitles N ms (positive = later, negative = earlier).
   # Tune if player shows subs consistently early or late after WhisperX.
   sync_offset_ms: 0
+  # Use the natural (unconstrained) translation for SRT text instead of the
+  # length-fitted text used by the TTS.  Better readability; requires
+  # translation.natural_pass: true.  Falls back to the fitted text if missing.
+  use_natural_translation: true
 
 # ============================================================
 # Processing

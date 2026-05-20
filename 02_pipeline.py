@@ -137,6 +137,12 @@ class PipelineConfig:
     translation_temperature: float = 0.3
     translation_batch_size: int = 10
     translation_review: bool = True
+    # Target language for the dubbed output (drives CPS budget + TTS language).
+    target_lang: str = "fr"
+    # Safety multiplier on the per-segment character budget (1.1 = +10% headroom).
+    cps_safety: float = 1.1
+    # Also produce an unconstrained "natural" translation for use in SRT subtitles.
+    translate_natural_pass: bool = True
 
     # Speaker reference
     use_deepfilter: bool = True
@@ -145,7 +151,7 @@ class PipelineConfig:
 
     # TTS — VoxCPM2 primary, XTTS v2 fallback
     tts_model: str = "openbmb/VoxCPM2"
-    tts_max_stretch: float = 1.15
+    tts_max_stretch: float = 1.10
     tts_cfg_value: float = 2.5
     tts_inference_timesteps: int = 24
     # Ultimate Cloning passes the reference transcript. For cross-lingual dubbing
@@ -162,6 +168,9 @@ class PipelineConfig:
     # SRT
     use_whisperx_alignment: bool = True
     subtitle_offset_ms: int = 0
+    # Use the natural (unconstrained) translation for SRT text instead of the
+    # length-fitted one used for audio. Better readability when both are available.
+    subtitles_use_natural: bool = True
 
     synthesis_sample_rate: int = 48000     # VoxCPM2 native
     output_sample_rate: int = 48000        # Vimeo accepts 48 kHz
@@ -198,11 +207,14 @@ def load_config(path: str) -> PipelineConfig:
         translation_temperature=t.get("temperature", 0.3),
         translation_batch_size=t.get("batch_size", 10),
         translation_review=t.get("review_pass", True),
+        target_lang=t.get("target_lang", "fr"),
+        cps_safety=t.get("cps_safety", 1.1),
+        translate_natural_pass=t.get("natural_pass", True),
         use_deepfilter=tts.get("use_deepfilter", True),
         tts_speaker_duration=tts.get("speaker_profile_duration", 25.0),
         tts_speaker_skip=tts.get("speaker_profile_skip", 20.0),
         tts_model=tts.get("model", "openbmb/VoxCPM2"),
-        tts_max_stretch=tts.get("max_stretch", 1.15),
+        tts_max_stretch=tts.get("max_stretch", 1.10),
         tts_cfg_value=tts.get("cfg_value", 2.5),
         tts_inference_timesteps=tts.get("inference_timesteps", 24),
         tts_use_prompt_text=tts.get("use_prompt_text", False),
@@ -214,6 +226,7 @@ def load_config(path: str) -> PipelineConfig:
         segment_merge_max_duration=tts.get("segment_merge_max_duration", 8.0),
         use_whisperx_alignment=sub.get("whisperx_alignment", True),
         subtitle_offset_ms=sub.get("sync_offset_ms", 0),
+        subtitles_use_natural=sub.get("use_natural_translation", True),
         synthesis_sample_rate=aud.get("synthesis_sample_rate", 48000),
         output_sample_rate=aud.get("output_sample_rate", 48000),
         timeout_seconds=proc.get("timeout_seconds", 7200),
@@ -430,38 +443,86 @@ def merge_segments(
 # Step 3: Translation — EuroLLM-9B primary + Qwen2.5 review
 # ============================================================================
 
-_TRANSLATE_PROMPT = """\
-You are a professional French dubbing translator.
-Translate the numbered English subtitle segments below into natural, conversational French.
+# Measured average TTS characters-per-second by language. Source: ZastTranslate
+# (fitted_cps_config.py). Used to compute a per-segment character budget so the
+# LLM produces a translation that fits the original audio window.
+LANG_CPS = {
+    # Latin (European) — same family, similar VoxCPM2 speaking rate
+    "fr": 9.0, "es": 9.0, "it": 9.0, "pt": 9.0,
+    "en": 14.0, "de": 9.0, "nl": 9.0, "da": 9.0, "sv": 9.0, "no": 9.0, "fi": 9.0,
+    "pl": 9.0, "tr": 9.0, "id": 9.0, "ms": 9.0, "tl": 9.0, "sw": 9.0,
+    # Cyrillic
+    "ru": 9.0, "el": 9.0,
+    # CJK — fewer characters per second of speech
+    "zh": 5.0, "ja": 5.5, "ko": 6.0,
+    # Other scripts
+    "ar": 8.0, "he": 8.0, "hi": 7.5, "th": 7.0, "vi": 9.0,
+    "my": 7.0, "km": 7.0, "lo": 7.0,
+}
+_DEFAULT_CPS = 7.5
 
-Rules:
-- Output ONLY the numbered translations, one per line, same numbering as input
-- Keep translations concise (similar syllable count to English for lip-sync)
-- Adapt idioms and expressions naturally; do not translate literally
-- Preserve technical terms and proper nouns where appropriate
-- No explanations, notes, or extra commentary
+def _budget_chars(seg: dict, lang: str, safety: float) -> int:
+    """Per-segment max character count for a length-fitted translation."""
+    duration = max(0.5, float(seg["end"]) - float(seg["start"]))
+    cps = LANG_CPS.get(lang, _DEFAULT_CPS)
+    return max(20, int(duration * cps * safety))
+
+
+_LANG_NAMES = {
+    "fr": "French", "es": "Spanish", "de": "German", "it": "Italian",
+    "pt": "Portuguese", "nl": "Dutch", "pl": "Polish", "ru": "Russian",
+    "ja": "Japanese", "ko": "Korean", "zh": "Chinese", "ar": "Arabic",
+    "tr": "Turkish", "hi": "Hindi", "vi": "Vietnamese",
+}
+
+_TRANSLATE_PROMPT = """\
+You are a professional {language} dubbing translator.
+Translate each numbered English segment into natural, conversational {language}
+that fits a strict character budget for lip-sync.
+
+CRITICAL RULES:
+- Each segment has a "(MAX N chars)" budget. Your translation MUST fit within it.
+- Be BRUTALLY concise: remove fillers, redundancies, and secondary details.
+- Use contractions, spoken-language forms, and shorter synonyms.
+- Adapt idioms naturally; do not translate literally.
+- Preserve key technical terms and proper nouns.
+- Output ONLY the numbered translations, one per line, same numbering as input.
+- No explanations, notes, or extra commentary.
+
+English segments with budgets:
+{segments}
+
+{language} translations:"""
+
+_TRANSLATE_NATURAL_PROMPT = """\
+You are a professional {language} translator for video subtitles.
+Translate each numbered English segment into fluent, natural {language}.
+Preserve meaning, tone, and nuance — readability is the priority, no length limit.
+
+- Output ONLY the numbered translations, one per line, same numbering as input.
+- No explanations, notes, or extra commentary.
 
 English segments:
 {segments}
 
-French translations:"""
+{language} translations:"""
 
 _REVIEW_PROMPT = """\
-You are a native French language expert reviewing dubbed video subtitles.
-Correct any unnatural phrasing, Anglicisms, grammar errors, or register inconsistencies.
+You are a native {language} expert reviewing dubbed video subtitles.
+Correct any unnatural phrasing, Anglicisms, grammar errors, or register issues.
 
-CRITICAL CONSTRAINTS — these override everything else:
-- Output must be the SAME LENGTH OR SHORTER than the input (syllable count).
-  This is for video dubbing; longer French breaks lip-sync timing.
-- Prefer shorter, conversational French over formal/literary phrasing.
+CRITICAL CONSTRAINTS:
+- Output must be the SAME LENGTH OR SHORTER than the input (character count).
+  This is for video dubbing; longer text breaks lip-sync.
+- Prefer shorter, conversational {language} over formal/literary phrasing.
 - Keep changes minimal — only fix what is actually incorrect.
-- Do NOT expand abbreviations, add filler words, or improve "flow" if it adds length.
+- Do NOT add filler words or expand abbreviations.
 - Output only the corrected numbered list, same numbering as input.
 
-French subtitles to review:
+{language} subtitles to review:
 {segments}
 
-Corrected French subtitles:"""
+Corrected {language} subtitles:"""
 
 
 def check_ollama(model: str, log: logging.Logger) -> bool:
@@ -540,6 +601,47 @@ def _parse_numbered(text: str, count: int) -> List[str]:
     return [result.get(i + 1, "") for i in range(count)]
 
 
+def _format_fitted_segments(batch: List[dict], lang: str, safety: float) -> Tuple[str, List[int]]:
+    """Format a batch for the fitted-translation prompt and return per-segment budgets."""
+    budgets = [_budget_chars(s, lang, safety) for s in batch]
+    numbered = "\n".join(
+        f"{i + 1}. (MAX {budgets[i]} chars) {s['text']}"
+        for i, s in enumerate(batch)
+    )
+    return numbered, budgets
+
+
+def _llm_generate(
+    llm,
+    tokenizer,
+    prompt: str,
+    temperature: float,
+    max_new_tokens: int = 2048,
+) -> str:
+    """Single chat-template generation. Returns the decoded assistant response."""
+    messages = [{"role": "user", "content": prompt}]
+    inputs = tokenizer.apply_chat_template(
+        messages,
+        return_tensors="pt",
+        add_generation_prompt=True,
+        return_dict=True,
+    ).to("cuda")
+
+    with torch.no_grad():
+        output_ids = llm.generate(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            do_sample=temperature > 0,
+            pad_token_id=tokenizer.eos_token_id,
+        )
+
+    return tokenizer.decode(
+        output_ids[0][inputs["input_ids"].shape[-1]:],
+        skip_special_tokens=True,
+    ).strip()
+
+
 def translate_segments(
     segments: List[dict],
     eurollm_model_name: str,
@@ -548,12 +650,19 @@ def translate_segments(
     batch_size: int,
     log: logging.Logger,
     hf_token: str = os.environ.get("HF_TOKEN", ""),
+    target_lang: str = "fr",
+    cps_safety: float = 1.1,
+    natural_pass: bool = True,
 ) -> List[dict]:
-    """Translate with EuroLLM-9B-Instruct, a European-language specialist model.
+    """Translate with EuroLLM-9B-Instruct using a length-fitted prompt.
 
-    Runs on-GPU via HuggingFace transformers (8-bit quantized by default, ~9 GB VRAM).
-    Frees VRAM completely before returning so the review pass and TTS can load.
-    hf_token is required — EuroLLM-9B-Instruct is a gated HuggingFace model.
+    Each segment gets a character budget from its time slot × LANG_CPS[target_lang].
+    Overflowing segments are retried per-item with a 30% tighter budget (up to 3
+    iterations). If natural_pass is True, a second unconstrained pass is run and
+    stored in text_fr_natural for use in subtitles (and as a final fallback when
+    fitted retries exhaust).
+
+    Runs on-GPU via HuggingFace transformers (8-bit quantized by default, ~9 GB).
     """
     log.info(f"Loading EuroLLM: {eurollm_model_name} …")
     llm = None
@@ -587,50 +696,97 @@ def translate_segments(
         log.error(f"EuroLLM load failed: {e}")
         return [dict(s) for s in segments]
 
+    language = _LANG_NAMES.get(target_lang, target_lang.upper())
     out = [dict(s) for s in segments]
 
-    for start in tqdm(range(0, len(segments), batch_size), desc="Translating (EuroLLM)"):
-        batch   = segments[start : start + batch_size]
-        numbered = "\n".join(f"{i + 1}. {s['text']}" for i, s in enumerate(batch))
-        messages = [{"role": "user", "content": _TRANSLATE_PROMPT.format(segments=numbered)}]
+    # ── Pass 1: fitted batched translation ────────────────────────────────────
+    for start in tqdm(range(0, len(segments), batch_size), desc=f"Translating fitted ({target_lang})"):
+        batch = segments[start : start + batch_size]
+        numbered, budgets = _format_fitted_segments(batch, target_lang, cps_safety)
+        prompt = _TRANSLATE_PROMPT.format(language=language, segments=numbered)
 
         try:
-            # return_dict=True gives both input_ids AND attention_mask, which
-            # silences the "pad token == eos token, attention_mask not set"
-            # warning and produces more reliable generations.
-            inputs = tokenizer.apply_chat_template(
-                messages,
-                return_tensors="pt",
-                add_generation_prompt=True,
-                return_dict=True,
-            ).to("cuda")
-
-            with torch.no_grad():
-                output_ids = llm.generate(
-                    **inputs,
-                    max_new_tokens=2048,
-                    temperature=temperature,
-                    do_sample=temperature > 0,
-                    pad_token_id=tokenizer.eos_token_id,
-                )
-
-            response = tokenizer.decode(
-                output_ids[0][inputs["input_ids"].shape[-1]:],
-                skip_special_tokens=True,
-            ).strip()
-
+            response = _llm_generate(llm, tokenizer, prompt, temperature)
             translations = _parse_numbered(response, len(batch))
             for i, seg in enumerate(batch):
                 out[start + i]["text_fr"] = translations[i] or seg["text"]
-
+                out[start + i]["_budget"] = budgets[i]
         except Exception as e:
             log.warning(f"EuroLLM batch {start // batch_size + 1} failed: {e}")
             for i, seg in enumerate(batch):
                 out[start + i]["text_fr"] = seg["text"]
+                out[start + i]["_budget"] = budgets[i]
+
+    # ── Pass 2: per-segment overflow retry with tighter budget ───────────────
+    OVERFLOW_FACTOR = 1.4
+    MAX_RETRIES = 3
+    retried = 0
+    for idx, seg in enumerate(out):
+        budget = seg.get("_budget", _budget_chars(seg, target_lang, cps_safety))
+        text_fr = seg.get("text_fr", "")
+        attempt = 0
+        budget_now = budget
+        while attempt < MAX_RETRIES and len(text_fr) > budget * OVERFLOW_FACTOR:
+            attempt += 1
+            budget_now = max(20, int(budget_now * 0.7))
+            single_prompt = _TRANSLATE_PROMPT.format(
+                language=language,
+                segments=f"1. (MAX {budget_now} chars) {seg['text']}",
+            )
+            try:
+                response = _llm_generate(llm, tokenizer, single_prompt, temperature)
+                candidates = _parse_numbered(response, 1)
+                if candidates and candidates[0]:
+                    text_fr = candidates[0]
+            except Exception as e:
+                log.debug(f"Retry {attempt} on segment {idx} failed: {e}")
+                break
+        if attempt > 0:
+            retried += 1
+            log.debug(
+                f"  segment {idx}: budget={budget}, final_len={len(text_fr)}, "
+                f"retries={attempt}"
+            )
+        out[idx]["text_fr"] = text_fr
+
+    if retried:
+        log.info(f"  Retried {retried}/{len(out)} segments for overflow")
+
+    # ── Pass 3: optional natural (unconstrained) translation for SRT ─────────
+    if natural_pass:
+        for start in tqdm(range(0, len(segments), batch_size), desc=f"Translating natural ({target_lang})"):
+            batch = segments[start : start + batch_size]
+            numbered = "\n".join(f"{i + 1}. {s['text']}" for i, s in enumerate(batch))
+            prompt = _TRANSLATE_NATURAL_PROMPT.format(language=language, segments=numbered)
+            try:
+                response = _llm_generate(llm, tokenizer, prompt, 0.0)
+                translations = _parse_numbered(response, len(batch))
+                for i, seg in enumerate(batch):
+                    out[start + i]["text_fr_natural"] = translations[i] or out[start + i].get("text_fr", seg["text"])
+            except Exception as e:
+                log.warning(f"Natural-pass batch {start // batch_size + 1} failed: {e}")
+                for i in range(len(batch)):
+                    out[start + i]["text_fr_natural"] = out[start + i].get("text_fr", batch[i]["text"])
+
+        # Final fallback: if fitted text is still way over budget AND we have a
+        # natural translation, prefer the natural one (better than nothing).
+        # In practice this rarely triggers after the retry loop above.
+        salvaged = 0
+        for seg in out:
+            budget = seg.get("_budget", _budget_chars(seg, target_lang, cps_safety))
+            if (
+                len(seg.get("text_fr", "")) > budget * OVERFLOW_FACTOR
+                and seg.get("text_fr_natural")
+                and len(seg["text_fr_natural"]) < len(seg["text_fr"])
+            ):
+                seg["text_fr"] = seg["text_fr_natural"]
+                salvaged += 1
+        if salvaged:
+            log.info(f"  Used natural fallback for {salvaged} stubborn segment(s)")
 
     del llm, tokenizer
     free_vram(log)
-    log.info("✓ EuroLLM translation complete")
+    log.info(f"✓ EuroLLM translation complete ({target_lang})")
     return out
 
 
@@ -640,14 +796,17 @@ def review_translations(
     temperature: float,
     log: logging.Logger,
     batch_size: int = 50,
+    target_lang: str = "fr",
 ) -> List[dict]:
     log.info(f"Qwen review pass — {len(segments)} segments …")
+    language = _LANG_NAMES.get(target_lang, target_lang.upper())
     out = [dict(s) for s in segments]
 
-    for start in tqdm(range(0, len(segments), batch_size), desc="Reviewing (Qwen)"):
+    for start in tqdm(range(0, len(segments), batch_size), desc=f"Reviewing ({target_lang})"):
         batch   = segments[start : start + batch_size]
         numbered = "\n".join(f"{i + 1}. {s.get('text_fr', '')}" for i, s in enumerate(batch))
-        response = _ollama_call(_REVIEW_PROMPT.format(segments=numbered), model, temperature, log)
+        prompt = _REVIEW_PROMPT.format(language=language, segments=numbered)
+        response = _ollama_call(prompt, model, temperature, log)
         if response:
             corrected = _parse_numbered(response, len(batch))
             for i in range(len(batch)):
@@ -824,11 +983,14 @@ def synthesize_all_segments(
                         "text": text,
                         "cfg_value": cfg_value,
                         "inference_timesteps": inference_timesteps,
+                        # normalize=False protects French diacritics/digits from
+                        # VoxCPM2's English-centric text normalizer.
+                        "normalize": False,
                         "retry_badcase": True,
                         "retry_badcase_max_times": 3,
                     }
                     if speaker_wav and os.path.exists(speaker_wav):
-                        kwargs["prompt_wav_path"] = speaker_wav
+                        kwargs["reference_wav_path"] = speaker_wav
                         if use_prompt_text and reference_transcript:
                             kwargs["prompt_text"] = reference_transcript
                     wav = model.generate(**kwargs)
@@ -885,6 +1047,10 @@ def synthesize_all_segments(
 # Step 6: Audio Assembly, Encoding & Background Re-mix
 # ============================================================================
 
+_CROSSFADE_MS = 50.0   # equal-power crossfade between segments that overlap
+_FADE_OUT_MS  = 80.0   # cosine fade-out applied when an overflowing segment is truncated
+
+
 def _atempo_stretch(
     audio: np.ndarray,
     target_samples: int,
@@ -894,7 +1060,7 @@ def _atempo_stretch(
     log: logging.Logger,
 ) -> np.ndarray:
     ratio = len(audio) / max(target_samples, 1)
-    if ratio <= 1.05:
+    if ratio <= 1.02:
         return audio
 
     ratio   = min(ratio, max_ratio)
@@ -921,6 +1087,46 @@ def _atempo_stretch(
                 pass
 
 
+def _apply_fade_out(audio: np.ndarray, fade_samples: int) -> np.ndarray:
+    """Cosine fade-out over the last fade_samples. Modifies a copy in place."""
+    n = min(fade_samples, len(audio))
+    if n <= 0:
+        return audio
+    out = audio.copy()
+    # cosine ramp from 1 → 0
+    ramp = 0.5 * (1.0 + np.cos(np.linspace(0, np.pi, n, dtype=np.float32)))
+    out[-n:] *= ramp
+    return out
+
+
+def _equal_power_crossfade(buf: np.ndarray, start: int, new_audio: np.ndarray, xfade_samples: int) -> int:
+    """Mix new_audio into buf starting at `start`, using an equal-power crossfade
+    over xfade_samples for any overlap with existing non-zero content.
+    Returns the number of samples written (clamped to buf length)."""
+    end = min(start + len(new_audio), len(buf))
+    n   = end - start
+    if n <= 0:
+        return 0
+
+    # Determine the actual overlap region: where buf already has audio
+    # (use a small absolute threshold to detect prior content).
+    xfade = max(0, min(xfade_samples, n))
+    existing = buf[start : start + xfade]
+    has_overlap = xfade > 0 and float(np.max(np.abs(existing))) > 1e-4
+
+    if has_overlap:
+        # Equal-power (sin/cos) crossfade
+        t       = np.linspace(0, 1, xfade, dtype=np.float32)
+        fade_out = np.cos(0.5 * np.pi * t)   # existing buf side
+        fade_in  = np.sin(0.5 * np.pi * t)   # new audio side
+        buf[start : start + xfade] = existing * fade_out + new_audio[:xfade] * fade_in
+        if n > xfade:
+            buf[start + xfade : end] = new_audio[xfade : n]
+    else:
+        buf[start : end] = new_audio[:n]
+    return n
+
+
 def assemble_and_encode(
     synthesized: List[Tuple[np.ndarray, float, float]],
     total_duration: float,
@@ -932,28 +1138,65 @@ def assemble_and_encode(
     temp_dir: str,
     log: logging.Logger,
 ) -> bool:
-    log.info(f"Assembling {len(synthesized)} segments at {src_rate} Hz …")
+    """Place each synthesized segment into the timeline.
+
+    Per-segment policy (in order):
+      1. Try to fit in the original window + 1 borrowed gap from the next segment.
+      2. If audio still overflows by ≤ max_stretch (default 1.10×): atempo stretch.
+      3. If audio overflows by > max_stretch: truncate with an 80ms cosine fade-out.
+    Adjacent segments are joined with a 50ms equal-power crossfade when they
+    physically overlap in the buffer.
+    """
+    log.info(
+        f"Assembling {len(synthesized)} segments at {src_rate} Hz "
+        f"(stretch ≤ {max_stretch:.2f}, crossfade {_CROSSFADE_MS:.0f}ms) …"
+    )
 
     total_samples = int((total_duration + 2) * src_rate)
     assembled     = np.zeros(total_samples, dtype=np.float32)
     ordered       = sorted(synthesized, key=lambda x: x[1])
 
+    xfade_samples = int(_CROSSFADE_MS / 1000.0 * src_rate)
+    fade_samples  = int(_FADE_OUT_MS / 1000.0 * src_rate)
+
+    stretched_count = 0
+    truncated_count = 0
+
     for i, (audio, start, end) in enumerate(ordered):
         start_s  = int(start * src_rate)
         window_s = int((end - start) * src_rate)
 
+        # Gap-borrow: include silence up to the next segment's start (minus a
+        # 50ms breathing room). The final segment can extend to the file end.
         if i + 1 < len(ordered):
-            next_s    = int(ordered[i + 1][1] * src_rate) - int(0.1 * src_rate)
-            available = max(window_s, next_s - start_s)
+            next_start_s = int(ordered[i + 1][1] * src_rate)
+            available    = max(window_s, next_start_s - start_s - xfade_samples)
         else:
             available = max(window_s, total_samples - start_s)
 
+        # Decide what to do with overflow.
         if len(audio) > available:
-            audio = _atempo_stretch(audio, available, src_rate, max_stretch, temp_dir, log)
+            ratio = len(audio) / max(available, 1)
+            if ratio <= max_stretch:
+                audio = _atempo_stretch(audio, available, src_rate, max_stretch, temp_dir, log)
+                stretched_count += 1
+            else:
+                # Truncate with a cosine fade-out at the cut.
+                audio = _apply_fade_out(audio[:available], fade_samples)
+                truncated_count += 1
+                log.debug(
+                    f"  segment {i}: truncated ({ratio:.2f}× over budget, "
+                    f"available={available / src_rate:.2f}s)"
+                )
 
-        place_len = min(len(audio), total_samples - start_s)
-        if place_len > 0:
-            assembled[start_s : start_s + place_len] = audio[:place_len]
+        # Crossfade-aware placement into the buffer.
+        _equal_power_crossfade(assembled, start_s, audio, xfade_samples)
+
+    if stretched_count or truncated_count:
+        log.info(
+            f"  Overflow handling: {stretched_count} stretched (≤{max_stretch:.2f}×), "
+            f"{truncated_count} truncated with fade-out"
+        )
 
     peak = np.max(np.abs(assembled))
     if peak > 0:
@@ -1046,12 +1289,26 @@ def create_srt(
     output_path: str,
     log: logging.Logger,
     offset_ms: int = 0,
+    text_key: Optional[str] = None,
 ) -> bool:
+    """Write segments to an SRT file.
+
+    text_key selects which field to use as subtitle text. Lookup order per seg:
+      1. seg[text_key] (if text_key is provided and present)
+      2. seg["text_fr_natural"] (natural translation, best readability)
+      3. seg["text_fr"]          (length-fitted translation)
+      4. seg["text"]             (original English fallback)
+    """
+    def _pick(seg: dict) -> str:
+        if text_key and seg.get(text_key):
+            return seg[text_key]
+        return seg.get("text_fr_natural") or seg.get("text_fr") or seg["text"]
+
     try:
         offset_s = offset_ms / 1000.0
         subs     = pysrt.SubRipFile()
         for idx, seg in enumerate(segments, 1):
-            text  = _wrap_subtitle(seg.get("text_fr") or seg["text"])
+            text  = _wrap_subtitle(_pick(seg))
             start = max(0.0, seg["start"] + offset_s)
             end   = max(start + 0.1, seg["end"] + offset_s)
             subs.append(SubRipItem(
@@ -1074,26 +1331,36 @@ def align_srt_with_whisperx(
     output_srt: str,
     log: logging.Logger,
     offset_ms: int = 0,
+    target_lang: str = "fr",
+    use_natural: bool = True,
 ) -> bool:
-    """Force-align French text against the assembled French audio using WhisperX.
+    """Force-align the dubbed text against the dubbed audio using WhisperX.
 
-    The resulting SRT timestamps match the actual French speech positions, not
-    the original English timing windows. This is the correct timing for the
-    French alternate audio track on Vimeo.
+    The resulting SRT timestamps match the actual TTS speech positions, not the
+    original English timing windows.  When use_natural is True and a natural
+    (unconstrained) translation exists on each segment, it is used for the SRT
+    text — better readability than the length-fitted version that drives audio.
 
     Falls back to Whisper segment timestamps if WhisperX is unavailable.
     """
+    def _srt_text(s: dict) -> str:
+        if use_natural and s.get("text_fr_natural"):
+            return s["text_fr_natural"]
+        return s.get("text_fr") or s["text"]
+
     try:
         import whisperx
 
-        log.info("WhisperX: force-aligning French text to French audio …")
+        log.info(f"WhisperX: force-aligning {target_lang} text to dubbed audio …")
         device   = "cuda" if torch.cuda.is_available() else "cpu"
+        # WhisperX aligns audio to the fitted text (matches what was synthesized);
+        # the natural text is only swapped in for the final SRT output below.
         wx_input = [
             {"start": s["start"], "end": s["end"], "text": s.get("text_fr") or s["text"]}
             for s in segments
         ]
 
-        model_a, metadata = whisperx.load_align_model(language_code="fr", device=device)
+        model_a, metadata = whisperx.load_align_model(language_code=target_lang, device=device)
         aligned            = whisperx.align(wx_input, model_a, metadata, french_wav, device)
 
         aligned_segs = aligned.get("segments", wx_input)
@@ -1102,19 +1369,22 @@ def align_srt_with_whisperx(
             s          = dict(orig)
             s["start"] = aln.get("start", orig["start"])
             s["end"]   = aln.get("end",   orig["end"])
+            s["_srt_text"] = _srt_text(orig)
             updated.append(s)
 
         del model_a
         free_vram(log)
         log.info("✓ WhisperX alignment complete")
-        return create_srt(updated, output_srt, log, offset_ms=offset_ms)
+        return create_srt(updated, output_srt, log, offset_ms=offset_ms, text_key="_srt_text")
 
     except ImportError:
         log.warning("whisperx not installed (pip install whisperx) — using Whisper timestamps")
     except Exception as e:
         log.warning(f"WhisperX alignment failed ({e}) — using Whisper timestamps")
 
-    return create_srt(segments, output_srt, log, offset_ms=offset_ms)
+    # No alignment: stamp the SRT text on each segment before creating the file.
+    annotated = [dict(s, _srt_text=_srt_text(s)) for s in segments]
+    return create_srt(annotated, output_srt, log, offset_ms=offset_ms, text_key="_srt_text")
 
 
 # ============================================================================
@@ -1199,6 +1469,9 @@ def process_video(
         config.translation_batch_size,
         log,
         hf_token=config.huggingface_token,
+        target_lang=config.target_lang,
+        cps_safety=config.cps_safety,
+        natural_pass=config.translate_natural_pass,
     )
     _verify_translation_quality(segments, log)
 
@@ -1206,7 +1479,11 @@ def process_video(
     if config.translation_review:
         log.info("\n[3b/7] REVIEWING TRANSLATIONS (Qwen2.5)")
         segments = review_translations(
-            segments, config.translation_model, config.translation_temperature, log
+            segments,
+            config.translation_model,
+            config.translation_temperature,
+            log,
+            target_lang=config.target_lang,
         )
 
     # ── 4. Extract + denoise speaker reference ────────────────────────────────
@@ -1282,10 +1559,22 @@ def process_video(
     log.info("\n[7/7] GENERATING SUBTITLES")
     if config.use_whisperx_alignment:
         align_srt_with_whisperx(
-            interim_wav, segments, final_srt, log, offset_ms=config.subtitle_offset_ms
+            interim_wav,
+            segments,
+            final_srt,
+            log,
+            offset_ms=config.subtitle_offset_ms,
+            target_lang=config.target_lang,
+            use_natural=config.subtitles_use_natural,
         )
     else:
-        create_srt(segments, final_srt, log, offset_ms=config.subtitle_offset_ms)
+        create_srt(
+            segments,
+            final_srt,
+            log,
+            offset_ms=config.subtitle_offset_ms,
+            text_key="text_fr_natural" if config.subtitles_use_natural else "text_fr",
+        )
 
     shutil.rmtree(temp_dir, ignore_errors=True)
 
