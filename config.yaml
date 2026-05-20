@@ -1,0 +1,161 @@
+# French Dubbing Pipeline v3.0 — Configuration
+# Place at /workspace/config.yaml
+
+# ============================================================
+# Paths  (created automatically by setup.sh)
+# ============================================================
+pipeline:
+  input_folder:  /workspace/videos/input
+  output_folder: /workspace/outputs
+  models_folder: /workspace/models
+  logs_folder:   /workspace/logs
+  temp_folder:   /workspace/temp
+
+# ============================================================
+# Audio
+# ============================================================
+audio:
+  # VoxCPM2 native synthesis rate — 48 kHz, higher quality than XTTS (24 kHz)
+  synthesis_sample_rate: 48000
+  # Vimeo accepts both 44100 and 48000 Hz; 48000 avoids resampling loss
+  output_sample_rate: 48000
+
+# ============================================================
+# Source Separation — Demucs
+# Separates speaker vocals from background music/noise before
+# transcription and voice cloning.  Cleaner input → better
+# Whisper accuracy and better voice-clone fidelity.
+# ============================================================
+source_separation:
+  enabled: true
+  # htdemucs    → best quality (hybrid transformer, recommended)
+  # htdemucs_ft → fine-tuned variant, slightly slower
+  # mdx_extra   → lighter, good balance of speed and quality
+  model: htdemucs
+  # Re-mix the original background track (music, room ambience) back with
+  # the French dubbed vocals into a separate *_french_full.m4a output file.
+  preserve_background: true
+
+# ============================================================
+# Transcription — faster-whisper (CTranslate2)
+# ============================================================
+whisper:
+  model: large-v3
+  language: en
+  device: cuda
+  # float16       → best quality on RTX 4090
+  # int8_float16  → lower VRAM, marginal accuracy loss
+  compute_type: float16
+
+# ============================================================
+# Translation — EuroLLM-9B primary + Qwen2.5 review
+# EuroLLM is a European-language specialist (9B params, ~9 GB
+# VRAM in 8-bit). Qwen2.5 does a second pass for naturalness.
+# ============================================================
+translation:
+  # EuroLLM-9B-Instruct — runs on-GPU via HuggingFace transformers
+  eurollm_model: utter-project/EuroLLM-9B-Instruct
+  # 8-bit quantization: ~9 GB VRAM vs ~18 GB in bfloat16
+  # Set false if you have headroom and want maximum quality
+  eurollm_quantize: true
+  # HuggingFace token — required for EuroLLM-9B-Instruct (gated model).
+  # Get yours at https://huggingface.co/settings/tokens after requesting
+  # access at https://huggingface.co/utter-project/EuroLLM-9B-Instruct
+  # Leave blank to read from the HF_TOKEN environment variable instead.
+  huggingface_token: ""
+
+  # Qwen2.5 via Ollama — review/naturalness pass only
+  model: qwen2.5:14b
+  temperature: 0.3
+  batch_size: 10
+  review_pass: true
+
+# ============================================================
+# Text-to-Speech — VoxCPM2
+# 2B diffusion autoregressive model, 48 kHz output, 30 languages.
+# Ultimate Cloning mode uses both reference audio AND its transcript
+# for maximum voice fidelity (transcript comes from Whisper for free).
+# Falls back to Coqui XTTS v2 if voxcpm is not installed.
+# ============================================================
+tts:
+  model: openbmb/VoxCPM2
+  language: fr
+
+  # Speaker reference clip for voice cloning
+  # 25 s gives VoxCPM2 substantially more voice data than 15 s
+  speaker_profile_duration: 25
+  # Skip this many seconds from the start (avoids intro music / title cards)
+  speaker_profile_skip: 20
+
+  # DeepFilterNet denoising on the speaker reference clip.
+  # Removes room noise / reverb before it reaches the voice cloner.
+  use_deepfilter: true
+
+  # Max atempo ratio for segments that still overflow after VoxCPM2 synthesis.
+  # French is ~20% longer than English; VoxCPM2 handles most of this via its
+  # internal duration model.  Keep ≤ 1.2 — higher values sound degraded.
+  max_stretch: 1.15
+
+  # VoxCPM2 inference quality knobs.
+  # cfg_value: LM guidance strength.  Higher = better adherence to prompt voice
+  #   but worse audio quality past ~3.0.  2.5 is a good cross-lingual default.
+  cfg_value: 2.5
+  # inference_timesteps: LocDiT diffusion steps.  Default 10 is fast but noisy;
+  #   24 is the sweet spot for production dubbing.  32 for absolute max quality.
+  inference_timesteps: 24
+  # use_prompt_text: Pass the reference audio's transcript to VoxCPM2 ("Ultimate
+  #   Cloning" mode).  Helps same-language cloning, but for cross-lingual dubbing
+  #   (English ref → French output) it bleeds English phonemes — keep false.
+  use_prompt_text: false
+
+  # Merge consecutive Whisper fragments into sentence-level chunks before TTS.
+  # Sub-second fragments synthesized individually produce choppy, robotic output.
+  segment_merge_gap: 0.8           # max silence gap (s) to merge across
+  segment_merge_max_duration: 8.0  # max merged chunk length (s)
+
+# ============================================================
+# Subtitles
+# ============================================================
+subtitles:
+  format: srt
+  encoding: utf-8
+  # WhisperX force-aligns the French text against the assembled French audio,
+  # producing timestamps that match the French speech rather than the original
+  # English timing windows.  This is the correct timing for a Vimeo alternate
+  # audio track.  Requires: pip install whisperx
+  whisperx_alignment: true
+  # Shift all subtitles N ms (positive = later, negative = earlier).
+  # Tune if player shows subs consistently early or late after WhisperX.
+  sync_offset_ms: 0
+
+# ============================================================
+# Processing
+# ============================================================
+processing:
+  max_workers: 1       # keep at 1 — models share 24 GB VRAM
+  timeout_seconds: 7200
+
+# ============================================================
+# Profiles — uncomment to override defaults
+# ============================================================
+
+# FAST TESTING (skip heavy models, rough quality):
+# source_separation:
+#   enabled: false
+# whisper:
+#   model: medium
+#   compute_type: int8_float16
+# translation:
+#   eurollm_quantize: true
+#   review_pass: false
+# tts:
+#   use_deepfilter: false
+# subtitles:
+#   whisperx_alignment: false
+
+# MAXIMUM QUALITY (no quantization, full alignment):
+# translation:
+#   eurollm_quantize: false
+#   temperature: 0.2
+# tts:
+#   max_stretch: 1.1

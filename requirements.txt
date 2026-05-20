@@ -1,0 +1,75 @@
+# French Dubbing Pipeline v3.0 — Python Dependencies
+# Install: pip install -r requirements.txt
+#
+# NOTE: torch==2.8.0 and torchaudio==2.8.0 are PRE-INSTALLED on the RunPod
+# pytorch:1.0.2-cu1281-torch280-ubuntu2404 image.
+# If installing outside RunPod, add:
+#   pip install torch==2.8.0 torchaudio==2.8.0 --index-url https://download.pytorch.org/whl/cu128
+
+# ── Audio / Video ──────────────────────────────────────────────────────────────
+# numpy<2.0.0 required by Coqui TTS fallback (XTTS v2)
+numpy>=1.26.4,<2.0.0
+scipy>=1.13.1
+librosa>=0.10.2
+soundfile>=0.12.1
+pydub>=0.25.1
+
+# ── Source Separation — Demucs ─────────────────────────────────────────────────
+# Facebook Research, MIT license.  Separates speech from background music/noise.
+demucs>=4.0.0
+
+# ── Transcription — faster-whisper (CTranslate2) ──────────────────────────────
+faster-whisper>=1.0.0
+
+# ── Translation — EuroLLM via HuggingFace transformers ────────────────────────
+# EuroLLM-9B-Instruct is downloaded automatically on first run (~18 GB).
+# bitsandbytes enables 8-bit quantization (~9 GB VRAM instead of ~18 GB).
+transformers>=4.40.2
+bitsandbytes>=0.41.0
+accelerate>=0.27.0
+
+# ── Speaker Denoising (in priority order — first available is used) ────────────
+# DeepFilterNet: best quality (neural, 48 kHz). Install without version pin;
+# if it fails on your platform, noisereduce or FFmpeg anlmdn will be used instead.
+deepfilternet
+# noisereduce: spectral gating, pure Python, reliable fallback.
+noisereduce>=3.0.0
+# FFmpeg anlmdn is also tried as a final fallback (requires only ffmpeg system pkg).
+
+# ── TTS — VoxCPM2 (primary) ───────────────────────────────────────────────────
+# OpenBMB, Apache 2.0 license.  2B diffusion AR model, 48 kHz, 30 languages.
+# Ultimate Cloning mode uses both reference audio + transcript for max fidelity.
+voxcpm
+
+# ── TTS — Coqui XTTS v2 (fallback if voxcpm not installed) ───────────────────
+# Community-maintained PyPI fork of the original TTS package.
+# Installs to same TTS.* namespace; no code changes needed.
+coqui-tts
+# Pin transformers so coqui-tts's dep resolution doesn't upgrade past 4.40.2.
+# 02_pipeline.py also patches the two removed symbols at runtime as a belt-and-
+# suspenders fix (isin_mps_friendly + is_torch_greater_or_equal).
+# Install order matters: coqui-tts first, then force-reinstall transformers.
+
+# ── SRT Alignment — WhisperX ──────────────────────────────────────────────────
+# Force-aligns French text to French audio for accurate subtitle timestamps.
+# Requires a wav2vec2 French alignment model (downloaded automatically).
+whisperx
+
+# ── Subtitles ─────────────────────────────────────────────────────────────────
+pysrt>=1.1.2
+
+# ── LLM review pass — Qwen2.5 via local Ollama ────────────────────────────────
+requests>=2.32.0
+
+# ── HuggingFace download acceleration ─────────────────────────────────────────
+# Rust-based transfer client — multi-connection, multi-GB/s. Activated by the
+# HF_HUB_ENABLE_HF_TRANSFER=1 env var that 02_pipeline.py sets at import time.
+hf_transfer>=0.1.6
+
+# ── Utilities ─────────────────────────────────────────────────────────────────
+# python-dotenv loads .env from project root so HF_TOKEN works without `source`.
+python-dotenv>=1.0.0
+tqdm>=4.66.0
+click>=8.1.7
+pyyaml>=6.0.1
+packaging>=23.0

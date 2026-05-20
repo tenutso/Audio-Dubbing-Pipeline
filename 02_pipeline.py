@@ -1,0 +1,1323 @@
+#!/usr/bin/env python3
+"""
+French Dubbing Pipeline v3.0
+
+English webinar → French audio track + SRT subtitles
+
+Stack:
+  Source separation : Demucs htdemucs         (vocals + background split)
+  Transcription     : faster-whisper large-v3  (CTranslate2, float16, word timestamps)
+  Translation       : EuroLLM-9B-Instruct      (European language specialist, on-GPU)
+  Review            : Qwen2.5:14b via Ollama   (French naturalness / idiom pass)
+  Speaker denoising : DeepFilterNet            (clean voice reference for cloning)
+  TTS               : VoxCPM2 (2B, 48 kHz)    (diffusion AR, Ultimate Cloning mode)
+  Assembly          : FFmpeg atempo            (fit French into original timing windows)
+  SRT alignment     : WhisperX                (force-align French text to French audio)
+  Output            : AAC 192 kbps 48000 Hz stereo  +  UTF-8 SRT
+"""
+
+import gc
+import logging
+import os
+import re
+import shutil
+import subprocess
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import List, Optional, Tuple
+
+# Enable accelerated HF downloads. MUST be set before huggingface_hub is imported.
+os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
+os.environ["COQUI_TOS_AGREED"] = "1"
+
+# Load .env from project root (and /workspace/.env on RunPod) so HF_TOKEN is
+# available without requiring the user to `source` it in their shell.
+def _load_dotenv() -> None:
+    try:
+        from dotenv import load_dotenv
+    except ImportError:
+        return
+    for candidate in (
+        Path(__file__).resolve().parent / ".env",
+        Path("/workspace/.env"),
+    ):
+        if candidate.exists():
+            load_dotenv(candidate, override=False)
+
+_load_dotenv()
+
+# Normalize the various HF token env var names HF libraries accept.
+_hf_tok = (
+    os.environ.get("HF_TOKEN")
+    or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+    or os.environ.get("HUGGINGFACE_HUB_TOKEN")
+    or ""
+)
+if _hf_tok:
+    os.environ["HF_TOKEN"] = _hf_tok
+    os.environ["HUGGING_FACE_HUB_TOKEN"] = _hf_tok
+
+import click
+import librosa
+import numpy as np
+import pysrt
+import requests
+import soundfile as sf
+import torch
+import yaml
+from pysrt import SubRipItem, SubRipTime
+from tqdm import tqdm
+
+from faster_whisper import WhisperModel
+
+# ── Transformers compatibility shim ───────────────────────────────────────────
+# Coqui XTTS v2 (fallback) imports symbols removed in transformers 4.41+.
+# Patch before any TTS import so the import chain succeeds on any version.
+def _patch_transformers_for_coqui():
+    import importlib
+    from packaging.version import Version as _V
+
+    try:
+        m = importlib.import_module("transformers.pytorch_utils")
+        if not hasattr(m, "isin_mps_friendly"):
+            m.isin_mps_friendly = torch.isin
+    except Exception:
+        pass
+
+    try:
+        m = importlib.import_module("transformers.utils.import_utils")
+        if not hasattr(m, "is_torch_greater_or_equal"):
+            def _gte(version, revision=None):
+                v = f"{version}.{revision}" if revision else version
+                return _V(torch.__version__.split("+")[0]) >= _V(v)
+            m.is_torch_greater_or_equal = _gte
+            tu = importlib.import_module("transformers.utils")
+            if not hasattr(tu, "is_torch_greater_or_equal"):
+                tu.is_torch_greater_or_equal = _gte
+    except Exception:
+        pass
+
+_patch_transformers_for_coqui()
+
+# Optional XTTS v2 — used only if voxcpm is not installed
+try:
+    from TTS.api import TTS as CoquiTTS
+    HAS_XTTS = True
+except ImportError:
+    HAS_XTTS = False
+
+
+# ============================================================================
+# Configuration
+# ============================================================================
+
+@dataclass
+class PipelineConfig:
+    input_folder: str
+    output_folder: str
+    models_folder: str
+    logs_folder: str
+    temp_folder: str
+
+    # Transcription
+    whisper_model: str = "large-v3"
+    whisper_device: str = "cuda"
+    whisper_compute_type: str = "float16"
+
+    # Source separation
+    use_demucs: bool = True
+    demucs_model: str = "htdemucs"
+    preserve_background: bool = True
+
+    # Translation — EuroLLM primary, Qwen review
+    eurollm_model: str = "utter-project/EuroLLM-9B-Instruct"
+    eurollm_quantize: bool = True          # 8-bit to save VRAM (~9 GB vs ~18 GB)
+    translation_model: str = "qwen2.5:14b" # Ollama — review pass only
+    translation_temperature: float = 0.3
+    translation_batch_size: int = 10
+    translation_review: bool = True
+
+    # Speaker reference
+    use_deepfilter: bool = True
+    tts_speaker_duration: float = 25.0
+    tts_speaker_skip: float = 20.0         # skip past intro/title cards
+
+    # TTS — VoxCPM2 primary, XTTS v2 fallback
+    tts_model: str = "openbmb/VoxCPM2"
+    tts_max_stretch: float = 1.15
+    tts_cfg_value: float = 2.5
+    tts_inference_timesteps: int = 24
+    # Ultimate Cloning passes the reference transcript. For cross-lingual dubbing
+    # (English reference → French output) it tends to bleed English phonemes.
+    tts_use_prompt_text: bool = False
+
+    # HuggingFace token — required for gated models (EuroLLM-9B-Instruct)
+    huggingface_token: str = ""
+
+    # Segment merging
+    segment_merge_gap: float = 0.8
+    segment_merge_max_duration: float = 8.0
+
+    # SRT
+    use_whisperx_alignment: bool = True
+    subtitle_offset_ms: int = 0
+
+    synthesis_sample_rate: int = 48000     # VoxCPM2 native
+    output_sample_rate: int = 48000        # Vimeo accepts 48 kHz
+
+    timeout_seconds: int = 7200
+
+
+def load_config(path: str) -> PipelineConfig:
+    with open(path) as f:
+        c = yaml.safe_load(f)
+    p    = c.get("pipeline", {})
+    w    = c.get("whisper", {})
+    t    = c.get("translation", {})
+    tts  = c.get("tts", {})
+    proc = c.get("processing", {})
+    aud  = c.get("audio", {})
+    sep  = c.get("source_separation", {})
+    sub  = c.get("subtitles", {})
+    return PipelineConfig(
+        input_folder=p.get("input_folder", "/workspace/videos/input"),
+        output_folder=p.get("output_folder", "/workspace/outputs"),
+        models_folder=p.get("models_folder", "/workspace/models"),
+        logs_folder=p.get("logs_folder", "/workspace/logs"),
+        temp_folder=p.get("temp_folder", "/workspace/temp"),
+        whisper_model=w.get("model", "large-v3"),
+        whisper_device=w.get("device", "cuda"),
+        whisper_compute_type=w.get("compute_type", "float16"),
+        use_demucs=sep.get("enabled", True),
+        demucs_model=sep.get("model", "htdemucs"),
+        preserve_background=sep.get("preserve_background", True),
+        eurollm_model=t.get("eurollm_model", "utter-project/EuroLLM-9B-Instruct"),
+        eurollm_quantize=t.get("eurollm_quantize", True),
+        translation_model=t.get("model", "qwen2.5:14b"),
+        translation_temperature=t.get("temperature", 0.3),
+        translation_batch_size=t.get("batch_size", 10),
+        translation_review=t.get("review_pass", True),
+        use_deepfilter=tts.get("use_deepfilter", True),
+        tts_speaker_duration=tts.get("speaker_profile_duration", 25.0),
+        tts_speaker_skip=tts.get("speaker_profile_skip", 20.0),
+        tts_model=tts.get("model", "openbmb/VoxCPM2"),
+        tts_max_stretch=tts.get("max_stretch", 1.15),
+        tts_cfg_value=tts.get("cfg_value", 2.5),
+        tts_inference_timesteps=tts.get("inference_timesteps", 24),
+        tts_use_prompt_text=tts.get("use_prompt_text", False),
+        huggingface_token=(
+            t.get("huggingface_token", "")
+            or os.environ.get("HF_TOKEN", "")
+        ),
+        segment_merge_gap=tts.get("segment_merge_gap", 0.8),
+        segment_merge_max_duration=tts.get("segment_merge_max_duration", 8.0),
+        use_whisperx_alignment=sub.get("whisperx_alignment", True),
+        subtitle_offset_ms=sub.get("sync_offset_ms", 0),
+        synthesis_sample_rate=aud.get("synthesis_sample_rate", 48000),
+        output_sample_rate=aud.get("output_sample_rate", 48000),
+        timeout_seconds=proc.get("timeout_seconds", 7200),
+    )
+
+
+def setup_logging(log_dir: str, name: str) -> logging.Logger:
+    os.makedirs(log_dir, exist_ok=True)
+    logger = logging.getLogger(name)
+    if logger.handlers:
+        return logger
+    logger.setLevel(logging.DEBUG)
+    fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s", "%H:%M:%S")
+    fh = logging.FileHandler(os.path.join(log_dir, f"{name}.log"))
+    fh.setLevel(logging.DEBUG)
+    fh.setFormatter(fmt)
+    ch = logging.StreamHandler()
+    ch.setLevel(logging.INFO)
+    ch.setFormatter(fmt)
+    logger.addHandler(fh)
+    logger.addHandler(ch)
+    return logger
+
+
+def free_vram(log: Optional[logging.Logger] = None) -> None:
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        if log:
+            used_gb = torch.cuda.memory_allocated() / 1e9
+            log.debug(f"VRAM after cleanup: {used_gb:.1f} GB")
+
+
+# ============================================================================
+# Step 0: Source Separation — Demucs
+# ============================================================================
+
+def separate_vocals(
+    video_path: str,
+    temp_dir: str,
+    model_name: str,
+    log: logging.Logger,
+) -> Tuple[Optional[str], Optional[str]]:
+    """Separate speaker vocals from background using Demucs.
+
+    Cleaner vocals → better Whisper accuracy and better voice-clone reference.
+    The background stem can optionally be re-mixed back with the French audio.
+    Returns (vocals_path, no_vocals_path); both None on failure.
+    """
+    log.info(f"[Demucs] Separating vocals — model: {model_name} …")
+    try:
+        subprocess.run(
+            [
+                sys.executable, "-m", "demucs",
+                "--two-stems", "vocals",
+                "-n", model_name,
+                "--out", temp_dir,
+                "--device", "cuda" if torch.cuda.is_available() else "cpu",
+                video_path,
+            ],
+            check=True, capture_output=True, text=True, timeout=1800,
+        )
+        vocals_files    = sorted(Path(temp_dir).rglob("vocals.wav"))
+        no_vocals_files = sorted(Path(temp_dir).rglob("no_vocals.wav"))
+
+        if not vocals_files:
+            log.error("Demucs output vocals.wav not found")
+            return None, None
+
+        vocals_path    = str(vocals_files[-1])
+        no_vocals_path = str(no_vocals_files[-1]) if no_vocals_files else None
+        log.info(f"✓ Vocals separated: {os.path.getsize(vocals_path) / 1e6:.1f} MB")
+        return vocals_path, no_vocals_path
+
+    except subprocess.TimeoutExpired:
+        log.error("Demucs timed out (30 min) — falling back to raw audio")
+    except Exception as e:
+        log.error(f"Demucs failed ({e}) — falling back to raw audio")
+    return None, None
+
+
+# ============================================================================
+# Step 1: Audio Extraction (fallback / duration probe)
+# ============================================================================
+
+def extract_audio(
+    video_path: str,
+    wav_path: str,
+    sample_rate: int,
+    log: logging.Logger,
+) -> bool:
+    log.info(f"Extracting audio → {Path(wav_path).name}")
+    try:
+        subprocess.run(
+            [
+                "ffmpeg", "-y", "-i", video_path,
+                "-vn", "-ac", "1",
+                "-ar", str(sample_rate),
+                "-acodec", "pcm_s16le",
+                wav_path,
+            ],
+            check=True, capture_output=True, timeout=600,
+        )
+        log.info(f"✓ Audio extracted: {os.path.getsize(wav_path) / 1e6:.1f} MB")
+        return True
+    except Exception as e:
+        log.error(f"Audio extraction failed: {e}")
+        return False
+
+
+def get_duration(video_path: str, log: logging.Logger) -> float:
+    try:
+        r = subprocess.run(
+            [
+                "ffprobe", "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                video_path,
+            ],
+            capture_output=True, text=True, timeout=30,
+        )
+        return float(r.stdout.strip())
+    except Exception as e:
+        log.warning(f"Could not read duration ({e}), defaulting to 3600 s")
+        return 3600.0
+
+
+# ============================================================================
+# Step 2: Transcription — faster-whisper
+# ============================================================================
+
+def transcribe_audio(
+    wav_path: str,
+    model_name: str,
+    device: str,
+    compute_type: str,
+    models_dir: str,
+    log: logging.Logger,
+) -> Optional[List[dict]]:
+    log.info(f"Loading faster-whisper {model_name} [{compute_type}] …")
+    try:
+        model = WhisperModel(
+            model_name,
+            device=device,
+            compute_type=compute_type,
+            download_root=os.path.join(models_dir, "whisper"),
+        )
+        log.info("Transcribing with VAD filter + word timestamps …")
+        segments_gen, info = model.transcribe(
+            wav_path,
+            language="en",
+            beam_size=5,
+            vad_filter=True,
+            vad_parameters={"min_silence_duration_ms": 300},
+            word_timestamps=True,
+        )
+        segments = [
+            {"id": i, "start": s.start, "end": s.end, "text": s.text.strip()}
+            for i, s in enumerate(segments_gen)
+            if s.text.strip()
+        ]
+        log.info(f"✓ {len(segments)} segments ({info.language} detected, {info.duration:.0f} s)")
+        del model
+        free_vram(log)
+        return segments
+    except Exception as e:
+        log.error(f"Transcription failed: {e}")
+        return None
+
+
+# ============================================================================
+# Step 2b: Segment merging
+# ============================================================================
+
+def merge_segments(
+    segments: List[dict],
+    max_gap: float,
+    max_duration: float,
+    log: logging.Logger,
+) -> List[dict]:
+    """Merge short Whisper fragments into sentence-level chunks.
+
+    Synthesizing sub-second fragments individually produces robotic, unnatural
+    output. Sentence-level chunks give VoxCPM2 the context needed for proper
+    intonation and natural rhythm.
+    """
+    if not segments:
+        return segments
+
+    merged: List[dict] = []
+    current = dict(segments[0])
+
+    for seg in segments[1:]:
+        gap          = seg["start"] - current["end"]
+        combined_dur = seg["end"] - current["start"]
+        ends_sent    = bool(re.search(r"[.!?]\s*$", current["text"].rstrip()))
+
+        if gap <= max_gap and combined_dur <= max_duration and not ends_sent:
+            current["end"]  = seg["end"]
+            current["text"] = current["text"].rstrip() + " " + seg["text"].lstrip()
+        else:
+            merged.append(current)
+            current = dict(seg)
+
+    merged.append(current)
+    for i, s in enumerate(merged):
+        s["id"] = i
+
+    log.info(f"✓ Merged {len(segments)} Whisper segments → {len(merged)} sentence-level chunks")
+    return merged
+
+
+# ============================================================================
+# Step 3: Translation — EuroLLM-9B primary + Qwen2.5 review
+# ============================================================================
+
+_TRANSLATE_PROMPT = """\
+You are a professional French dubbing translator.
+Translate the numbered English subtitle segments below into natural, conversational French.
+
+Rules:
+- Output ONLY the numbered translations, one per line, same numbering as input
+- Keep translations concise (similar syllable count to English for lip-sync)
+- Adapt idioms and expressions naturally; do not translate literally
+- Preserve technical terms and proper nouns where appropriate
+- No explanations, notes, or extra commentary
+
+English segments:
+{segments}
+
+French translations:"""
+
+_REVIEW_PROMPT = """\
+You are a native French language expert reviewing dubbed video subtitles.
+Correct any unnatural phrasing, Anglicisms, grammar errors, or register inconsistencies.
+
+CRITICAL CONSTRAINTS — these override everything else:
+- Output must be the SAME LENGTH OR SHORTER than the input (syllable count).
+  This is for video dubbing; longer French breaks lip-sync timing.
+- Prefer shorter, conversational French over formal/literary phrasing.
+- Keep changes minimal — only fix what is actually incorrect.
+- Do NOT expand abbreviations, add filler words, or improve "flow" if it adds length.
+- Output only the corrected numbered list, same numbering as input.
+
+French subtitles to review:
+{segments}
+
+Corrected French subtitles:"""
+
+
+def check_ollama(model: str, log: logging.Logger) -> bool:
+    try:
+        r = requests.get("http://localhost:11434/api/tags", timeout=5)
+    except requests.exceptions.ConnectionError:
+        log.error(
+            "Ollama is NOT running.\n"
+            "  Start it: nohup ollama serve > /workspace/logs/ollama.log 2>&1 &\n"
+            "  Wait 5 s, then re-run."
+        )
+        return False
+
+    if r.status_code != 200:
+        log.error(f"Ollama returned HTTP {r.status_code}")
+        return False
+
+    available  = [m["name"] for m in r.json().get("models", [])]
+    model_base = model.split(":")[0]
+    if not any(model_base in m for m in available):
+        log.error(
+            f"Model '{model}' not found.\n"
+            f"  Available: {available or ['(none)']}\n"
+            f"  Fix: ollama pull {model}"
+        )
+        return False
+
+    log.info(f"✓ Ollama ready — '{model}' available")
+    return True
+
+
+def _verify_translation_quality(segments: List[dict], log: logging.Logger) -> None:
+    unchanged = sum(1 for s in segments if s.get("text_fr") == s["text"])
+    pct = 100 * unchanged / max(len(segments), 1)
+    if pct > 50:
+        log.error(
+            f"TRANSLATION FAILURE: {unchanged}/{len(segments)} segments ({pct:.0f}%) "
+            f"still in English. Check EuroLLM download and VRAM availability."
+        )
+    elif unchanged > 0:
+        log.warning(f"{unchanged} segment(s) could not be translated — kept in English")
+
+
+def _ollama_call(prompt: str, model: str, temperature: float, log: logging.Logger) -> Optional[str]:
+    try:
+        r = requests.post(
+            "http://localhost:11434/api/generate",
+            json={
+                "model": model,
+                "prompt": prompt,
+                "stream": False,
+                "options": {"temperature": temperature, "num_predict": 4096},
+            },
+            timeout=180,
+        )
+        if r.status_code == 200:
+            return r.json().get("response", "").strip()
+        log.warning(f"Ollama HTTP {r.status_code}")
+        return None
+    except requests.exceptions.ConnectionError:
+        log.error("Cannot reach Ollama at localhost:11434.")
+        return None
+    except Exception as e:
+        log.error(f"Ollama call failed: {e}")
+        return None
+
+
+def _parse_numbered(text: str, count: int) -> List[str]:
+    result: dict = {}
+    for line in text.splitlines():
+        m = re.match(r"^[\(\[]?(\d+)[\.\)\]]\s+(.*)", line.strip())
+        if m:
+            idx, content = int(m.group(1)), m.group(2).strip()
+            if 1 <= idx <= count and content:
+                result[idx] = content
+    return [result.get(i + 1, "") for i in range(count)]
+
+
+def translate_segments(
+    segments: List[dict],
+    eurollm_model_name: str,
+    use_quantize: bool,
+    temperature: float,
+    batch_size: int,
+    log: logging.Logger,
+    hf_token: str = os.environ.get("HF_TOKEN", ""),
+) -> List[dict]:
+    """Translate with EuroLLM-9B-Instruct, a European-language specialist model.
+
+    Runs on-GPU via HuggingFace transformers (8-bit quantized by default, ~9 GB VRAM).
+    Frees VRAM completely before returning so the review pass and TTS can load.
+    hf_token is required — EuroLLM-9B-Instruct is a gated HuggingFace model.
+    """
+    log.info(f"Loading EuroLLM: {eurollm_model_name} …")
+    llm = None
+    tokenizer = None
+
+    if not hf_token:
+        log.error(
+            "No HuggingFace token found for EuroLLM (gated model).\n"
+            "  Set HF_TOKEN env var or add to config.yaml: translation.huggingface_token"
+        )
+        return [dict(s) for s in segments]
+
+    try:
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+
+        tokenizer   = AutoTokenizer.from_pretrained(eurollm_model_name, token=hf_token)
+        load_kwargs: dict = {"device_map": "cuda", "token": hf_token}
+        if use_quantize:
+            load_kwargs["load_in_8bit"] = True
+        else:
+            load_kwargs["torch_dtype"] = torch.bfloat16
+
+        llm = AutoModelForCausalLM.from_pretrained(eurollm_model_name, **load_kwargs)
+        llm.eval()
+        log.info("✓ EuroLLM ready")
+
+    except ImportError:
+        log.error("transformers not installed — segments left untranslated")
+        return [dict(s) for s in segments]
+    except Exception as e:
+        log.error(f"EuroLLM load failed: {e}")
+        return [dict(s) for s in segments]
+
+    out = [dict(s) for s in segments]
+
+    for start in tqdm(range(0, len(segments), batch_size), desc="Translating (EuroLLM)"):
+        batch   = segments[start : start + batch_size]
+        numbered = "\n".join(f"{i + 1}. {s['text']}" for i, s in enumerate(batch))
+        messages = [{"role": "user", "content": _TRANSLATE_PROMPT.format(segments=numbered)}]
+
+        try:
+            # return_dict=True gives both input_ids AND attention_mask, which
+            # silences the "pad token == eos token, attention_mask not set"
+            # warning and produces more reliable generations.
+            inputs = tokenizer.apply_chat_template(
+                messages,
+                return_tensors="pt",
+                add_generation_prompt=True,
+                return_dict=True,
+            ).to("cuda")
+
+            with torch.no_grad():
+                output_ids = llm.generate(
+                    **inputs,
+                    max_new_tokens=2048,
+                    temperature=temperature,
+                    do_sample=temperature > 0,
+                    pad_token_id=tokenizer.eos_token_id,
+                )
+
+            response = tokenizer.decode(
+                output_ids[0][inputs["input_ids"].shape[-1]:],
+                skip_special_tokens=True,
+            ).strip()
+
+            translations = _parse_numbered(response, len(batch))
+            for i, seg in enumerate(batch):
+                out[start + i]["text_fr"] = translations[i] or seg["text"]
+
+        except Exception as e:
+            log.warning(f"EuroLLM batch {start // batch_size + 1} failed: {e}")
+            for i, seg in enumerate(batch):
+                out[start + i]["text_fr"] = seg["text"]
+
+    del llm, tokenizer
+    free_vram(log)
+    log.info("✓ EuroLLM translation complete")
+    return out
+
+
+def review_translations(
+    segments: List[dict],
+    model: str,
+    temperature: float,
+    log: logging.Logger,
+    batch_size: int = 50,
+) -> List[dict]:
+    log.info(f"Qwen review pass — {len(segments)} segments …")
+    out = [dict(s) for s in segments]
+
+    for start in tqdm(range(0, len(segments), batch_size), desc="Reviewing (Qwen)"):
+        batch   = segments[start : start + batch_size]
+        numbered = "\n".join(f"{i + 1}. {s.get('text_fr', '')}" for i, s in enumerate(batch))
+        response = _ollama_call(_REVIEW_PROMPT.format(segments=numbered), model, temperature, log)
+        if response:
+            corrected = _parse_numbered(response, len(batch))
+            for i in range(len(batch)):
+                if corrected[i]:
+                    out[start + i]["text_fr"] = corrected[i]
+
+    log.info("✓ Review complete")
+    return out
+
+
+# ============================================================================
+# Step 4: Speaker Reference — extraction + denoising
+# ============================================================================
+
+def extract_speaker_sample(
+    wav_path: str,
+    duration: float,
+    output_path: str,
+    log: logging.Logger,
+    skip_seconds: float = 20.0,
+) -> bool:
+    """Extract a speaker reference clip for voice cloning.
+
+    Skips 20 s to avoid intro music and title cards common in webinars.
+    A 25 s reference gives VoxCPM2 substantially more voice data than 15 s.
+    16 kHz is VoxCPM2's spec'd input rate (AudioVAE V2 upsamples to 48 kHz).
+    """
+    try:
+        subprocess.run(
+            [
+                "ffmpeg", "-y", "-i", wav_path,
+                "-ss", str(skip_seconds),
+                "-t",  str(duration),
+                "-ar", "16000",
+                "-ac", "1",
+                output_path,
+            ],
+            check=True, capture_output=True, timeout=60,
+        )
+        log.info(f"✓ Speaker sample: {duration:.0f} s at {skip_seconds:.0f} s offset")
+        return True
+    except Exception as e:
+        log.error(f"Speaker sample extraction failed: {e}")
+        return False
+
+
+def denoise_audio(
+    audio_path: str,
+    output_path: str,
+    log: logging.Logger,
+) -> str:
+    """Denoise the speaker reference. Tries three methods in order:
+      1. DeepFilterNet  — best quality (48 kHz neural model)
+      2. noisereduce    — good quality, easy install (spectral gating)
+      3. FFmpeg anlmdn  — built-in, no extra package needed
+    Returns the denoised path on success, the original path if all methods fail.
+    """
+    # ── 1. DeepFilterNet ─────────────────────────────────────────────────────
+    try:
+        from df.enhance import enhance, init_df
+        try:
+            from df.enhance import load_audio, save_audio
+        except ImportError:
+            from df.io import load_audio, save_audio
+
+        log.info("Denoising with DeepFilterNet …")
+        model, df_state, _ = init_df()
+        audio, _  = load_audio(audio_path, sr=df_state.sr())
+        enhanced  = enhance(model, df_state, audio)
+        save_audio(output_path, enhanced, df_state.sr())
+        log.info("✓ Speaker reference denoised (DeepFilterNet)")
+        return output_path
+    except ImportError:
+        log.debug("DeepFilterNet not available — trying noisereduce")
+    except Exception as e:
+        log.warning(f"DeepFilterNet failed ({e}) — trying noisereduce")
+
+    # ── 2. noisereduce ───────────────────────────────────────────────────────
+    try:
+        import noisereduce as nr
+        import soundfile as _sf
+
+        log.info("Denoising with noisereduce …")
+        data, rate = _sf.read(audio_path)
+        reduced    = nr.reduce_noise(y=data, sr=rate, prop_decrease=0.75)
+        _sf.write(output_path, reduced, rate)
+        log.info("✓ Speaker reference denoised (noisereduce)")
+        return output_path
+    except ImportError:
+        log.debug("noisereduce not available — trying FFmpeg anlmdn")
+    except Exception as e:
+        log.warning(f"noisereduce failed ({e}) — trying FFmpeg anlmdn")
+
+    # ── 3. FFmpeg anlmdn (built-in, no extra packages) ───────────────────────
+    try:
+        log.info("Denoising with FFmpeg anlmdn …")
+        subprocess.run(
+            [
+                "ffmpeg", "-y", "-i", audio_path,
+                "-af", "anlmdn=s=7:p=0.002:r=0.002:m=15",
+                output_path,
+            ],
+            check=True, capture_output=True, timeout=60,
+        )
+        log.info("✓ Speaker reference denoised (FFmpeg anlmdn)")
+        return output_path
+    except Exception as e:
+        log.warning(f"FFmpeg anlmdn failed ({e}) — using raw speaker reference")
+        return audio_path
+
+
+def _get_reference_transcript(
+    segments: List[dict],
+    skip_seconds: float,
+    duration: float,
+) -> str:
+    """Collect the English transcript for the speaker reference window.
+
+    VoxCPM2 Ultimate Cloning takes both reference audio AND its transcript,
+    giving it more signal for voice fidelity. We already have the transcript
+    from Whisper, so this costs nothing extra.
+    """
+    ref_end = skip_seconds + duration + 5.0   # +5 s tolerance
+    texts = [
+        s["text"]
+        for s in segments
+        if s["start"] >= skip_seconds - 2.0 and s["end"] <= ref_end
+    ]
+    return " ".join(texts).strip()
+
+
+# ============================================================================
+# Step 5: TTS Synthesis — VoxCPM2 (XTTS v2 fallback)
+# ============================================================================
+
+def synthesize_all_segments(
+    segments: List[dict],
+    speaker_wav: Optional[str],
+    reference_transcript: str,
+    tts_model_id: str,
+    log: logging.Logger,
+    cfg_value: float = 2.5,
+    inference_timesteps: int = 24,
+    use_prompt_text: bool = False,
+) -> Tuple[List[Tuple[np.ndarray, float, float]], int]:
+    """Synthesize French audio using VoxCPM2 Ultimate Cloning.
+
+    Ultimate Cloning mode passes both the reference audio clip AND its English
+    transcript, giving VoxCPM2 maximum information to reproduce the speaker's
+    voice while synthesizing in French.
+
+    Returns (synthesized_segments, sample_rate_hz).
+    Falls back to Coqui XTTS v2 if voxcpm is not installed.
+    """
+    # ── VoxCPM2 ──────────────────────────────────────────────────────────────
+    try:
+        from voxcpm import VoxCPM
+
+        log.info(f"Loading VoxCPM2: {tts_model_id} …")
+        model = VoxCPM.from_pretrained(tts_model_id)
+        sr    = model.tts_model.sample_rate   # 48000
+        log.info(f"✓ VoxCPM2 ready (output: {sr} Hz)")
+
+        synthesized: List[Tuple[np.ndarray, float, float]] = []
+
+        with tqdm(total=len(segments), desc="Synthesizing (VoxCPM2)") as pbar:
+            for seg in segments:
+                text = seg.get("text_fr") or seg["text"]
+                if not text.strip():
+                    pbar.update(1)
+                    continue
+                try:
+                    kwargs: dict = {
+                        "text": text,
+                        "cfg_value": cfg_value,
+                        "inference_timesteps": inference_timesteps,
+                        "retry_badcase": True,
+                        "retry_badcase_max_times": 3,
+                    }
+                    if speaker_wav and os.path.exists(speaker_wav):
+                        kwargs["prompt_wav_path"] = speaker_wav
+                        if use_prompt_text and reference_transcript:
+                            kwargs["prompt_text"] = reference_transcript
+                    wav = model.generate(**kwargs)
+                    synthesized.append((np.array(wav, dtype=np.float32), seg["start"], seg["end"]))
+                except Exception as e:
+                    log.warning(f"Segment {seg['id']} VoxCPM2 failed: {e}")
+                pbar.update(1)
+
+        log.info(f"✓ Synthesized {len(synthesized)} segments at {sr} Hz")
+        del model
+        free_vram(log)
+        return synthesized, sr
+
+    except ImportError:
+        log.warning("voxcpm not installed — falling back to Coqui XTTS v2. Install: pip install voxcpm")
+
+    # ── XTTS v2 fallback ─────────────────────────────────────────────────────
+    if not HAS_XTTS:
+        log.error("Neither voxcpm nor Coqui TTS is installed. Cannot synthesize audio.")
+        return [], 24000
+
+    xtts_model_name = "tts_models/multilingual/multi-dataset/xtts_v2"
+    log.info(f"Loading XTTS v2 fallback …")
+    sr = 24000
+    try:
+        tts = CoquiTTS(xtts_model_name).to("cuda")
+    except Exception as e:
+        log.error(f"XTTS v2 load failed: {e}")
+        return [], sr
+
+    synthesized = []
+    with tqdm(total=len(segments), desc="Synthesizing (XTTS v2)") as pbar:
+        for seg in segments:
+            text = seg.get("text_fr") or seg["text"]
+            if not text.strip():
+                pbar.update(1)
+                continue
+            try:
+                kwargs = {"text": text[:220], "language": "fr", "speed": 1.0}
+                if speaker_wav and os.path.exists(speaker_wav):
+                    kwargs["speaker_wav"] = speaker_wav
+                wav = np.array(tts.tts(**kwargs), dtype=np.float32)
+                synthesized.append((wav, seg["start"], seg["end"]))
+            except Exception as e:
+                log.warning(f"Segment {seg['id']} XTTS failed: {e}")
+            pbar.update(1)
+
+    del tts
+    free_vram(log)
+    return synthesized, sr
+
+
+# ============================================================================
+# Step 6: Audio Assembly, Encoding & Background Re-mix
+# ============================================================================
+
+def _atempo_stretch(
+    audio: np.ndarray,
+    target_samples: int,
+    src_rate: int,
+    max_ratio: float,
+    temp_dir: str,
+    log: logging.Logger,
+) -> np.ndarray:
+    ratio = len(audio) / max(target_samples, 1)
+    if ratio <= 1.05:
+        return audio
+
+    ratio   = min(ratio, max_ratio)
+    tmp_in  = os.path.join(temp_dir, "_at_in.wav")
+    tmp_out = os.path.join(temp_dir, "_at_out.wav")
+    sf.write(tmp_in, audio, src_rate)
+
+    af = f"atempo={ratio:.4f}" if ratio <= 2.0 else f"atempo=2.0,atempo={ratio / 2:.4f}"
+    try:
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", tmp_in, "-af", af, tmp_out],
+            check=True, capture_output=True, timeout=60,
+        )
+        stretched, _ = librosa.load(tmp_out, sr=src_rate, mono=True)
+        return stretched
+    except Exception as e:
+        log.debug(f"atempo failed ({e}), truncating instead")
+        return audio[:target_samples]
+    finally:
+        for f in (tmp_in, tmp_out):
+            try:
+                os.unlink(f)
+            except OSError:
+                pass
+
+
+def assemble_and_encode(
+    synthesized: List[Tuple[np.ndarray, float, float]],
+    total_duration: float,
+    wav_path: str,
+    aac_path: str,
+    src_rate: int,
+    out_rate: int,
+    max_stretch: float,
+    temp_dir: str,
+    log: logging.Logger,
+) -> bool:
+    log.info(f"Assembling {len(synthesized)} segments at {src_rate} Hz …")
+
+    total_samples = int((total_duration + 2) * src_rate)
+    assembled     = np.zeros(total_samples, dtype=np.float32)
+    ordered       = sorted(synthesized, key=lambda x: x[1])
+
+    for i, (audio, start, end) in enumerate(ordered):
+        start_s  = int(start * src_rate)
+        window_s = int((end - start) * src_rate)
+
+        if i + 1 < len(ordered):
+            next_s    = int(ordered[i + 1][1] * src_rate) - int(0.1 * src_rate)
+            available = max(window_s, next_s - start_s)
+        else:
+            available = max(window_s, total_samples - start_s)
+
+        if len(audio) > available:
+            audio = _atempo_stretch(audio, available, src_rate, max_stretch, temp_dir, log)
+
+        place_len = min(len(audio), total_samples - start_s)
+        if place_len > 0:
+            assembled[start_s : start_s + place_len] = audio[:place_len]
+
+    peak = np.max(np.abs(assembled))
+    if peak > 0:
+        assembled *= 0.95 / peak
+
+    sf.write(wav_path, assembled, src_rate)
+    log.info(f"✓ WAV assembled: {os.path.getsize(wav_path) / 1e6:.1f} MB")
+
+    try:
+        subprocess.run(
+            [
+                "ffmpeg", "-y", "-i", wav_path,
+                "-ar", str(out_rate), "-ac", "2",
+                "-c:a", "aac", "-b:a", "192k",
+                aac_path,
+            ],
+            check=True, capture_output=True, timeout=300,
+        )
+        log.info(
+            f"✓ AAC encoded: {os.path.getsize(aac_path) / 1e6:.1f} MB "
+            f"@ 192 kbps {out_rate} Hz stereo"
+        )
+        return True
+    except Exception as e:
+        log.error(f"AAC encoding failed: {e}")
+        return False
+
+
+def remix_with_background(
+    french_wav: str,
+    no_vocals_wav: str,
+    output_aac: str,
+    log: logging.Logger,
+    bg_gain_db: float = -3.0,
+) -> bool:
+    """Mix French dubbed vocals with the original background (music, ambient sound).
+
+    The background is attenuated by 3 dB so dialogue stays intelligible.
+    Produces a second output file (_french_full.m4a) alongside the dry dub.
+    """
+    log.info("Re-mixing French vocals with original background …")
+    try:
+        subprocess.run(
+            [
+                "ffmpeg", "-y",
+                "-i", french_wav,
+                "-i", no_vocals_wav,
+                "-filter_complex",
+                (
+                    f"[1:a]volume={bg_gain_db}dB[bg];"
+                    "[0:a][bg]amix=inputs=2:duration=first[out]"
+                ),
+                "-map", "[out]",
+                "-ar", "48000", "-ac", "2",
+                "-c:a", "aac", "-b:a", "192k",
+                output_aac,
+            ],
+            check=True, capture_output=True, timeout=600,
+        )
+        log.info(f"✓ Background re-mixed: {os.path.getsize(output_aac) / 1e6:.1f} MB")
+        return True
+    except Exception as e:
+        log.error(f"Background re-mix failed: {e}")
+        return False
+
+
+# ============================================================================
+# Step 7: Subtitle Generation + WhisperX Alignment
+# ============================================================================
+
+def _wrap_subtitle(text: str, max_chars: int = 42) -> str:
+    if len(text) <= max_chars:
+        return text
+    words  = text.split()
+    lines: List[str] = []
+    line:  List[str] = []
+    for word in words:
+        if line and sum(len(w) for w in line) + len(line) - 1 + 1 + len(word) > max_chars:
+            lines.append(" ".join(line))
+            line = [word]
+        else:
+            line.append(word)
+    if line:
+        lines.append(" ".join(line))
+    return "\n".join(lines[:2])
+
+
+def create_srt(
+    segments: List[dict],
+    output_path: str,
+    log: logging.Logger,
+    offset_ms: int = 0,
+) -> bool:
+    try:
+        offset_s = offset_ms / 1000.0
+        subs     = pysrt.SubRipFile()
+        for idx, seg in enumerate(segments, 1):
+            text  = _wrap_subtitle(seg.get("text_fr") or seg["text"])
+            start = max(0.0, seg["start"] + offset_s)
+            end   = max(start + 0.1, seg["end"] + offset_s)
+            subs.append(SubRipItem(
+                index=idx,
+                start=SubRipTime(seconds=start),
+                end=SubRipTime(seconds=end),
+                text=text,
+            ))
+        subs.save(output_path, encoding="utf-8")
+        log.info(f"✓ SRT: {len(subs)} entries" + (f" (offset {offset_ms:+d} ms)" if offset_ms else ""))
+        return True
+    except Exception as e:
+        log.error(f"SRT creation failed: {e}")
+        return False
+
+
+def align_srt_with_whisperx(
+    french_wav: str,
+    segments: List[dict],
+    output_srt: str,
+    log: logging.Logger,
+    offset_ms: int = 0,
+) -> bool:
+    """Force-align French text against the assembled French audio using WhisperX.
+
+    The resulting SRT timestamps match the actual French speech positions, not
+    the original English timing windows. This is the correct timing for the
+    French alternate audio track on Vimeo.
+
+    Falls back to Whisper segment timestamps if WhisperX is unavailable.
+    """
+    try:
+        import whisperx
+
+        log.info("WhisperX: force-aligning French text to French audio …")
+        device   = "cuda" if torch.cuda.is_available() else "cpu"
+        wx_input = [
+            {"start": s["start"], "end": s["end"], "text": s.get("text_fr") or s["text"]}
+            for s in segments
+        ]
+
+        model_a, metadata = whisperx.load_align_model(language_code="fr", device=device)
+        aligned            = whisperx.align(wx_input, model_a, metadata, french_wav, device)
+
+        aligned_segs = aligned.get("segments", wx_input)
+        updated: List[dict] = []
+        for orig, aln in zip(segments, aligned_segs):
+            s          = dict(orig)
+            s["start"] = aln.get("start", orig["start"])
+            s["end"]   = aln.get("end",   orig["end"])
+            updated.append(s)
+
+        del model_a
+        free_vram(log)
+        log.info("✓ WhisperX alignment complete")
+        return create_srt(updated, output_srt, log, offset_ms=offset_ms)
+
+    except ImportError:
+        log.warning("whisperx not installed (pip install whisperx) — using Whisper timestamps")
+    except Exception as e:
+        log.warning(f"WhisperX alignment failed ({e}) — using Whisper timestamps")
+
+    return create_srt(segments, output_srt, log, offset_ms=offset_ms)
+
+
+# ============================================================================
+# Main Pipeline
+# ============================================================================
+
+def process_video(
+    video_path: str,
+    output_dir: str,
+    config: PipelineConfig,
+    log: logging.Logger,
+    force: bool = False,
+) -> bool:
+    name = Path(video_path).stem
+    os.makedirs(output_dir, exist_ok=True)
+    temp_dir = os.path.join(config.temp_folder, name)
+    os.makedirs(temp_dir, exist_ok=True)
+
+    final_aac = os.path.join(output_dir, f"{name}_french.m4a")
+    final_srt = os.path.join(output_dir, f"{name}_french.srt")
+
+    if not force and os.path.exists(final_aac) and os.path.exists(final_srt):
+        log.info(f"SKIP {name} — outputs exist (use --force to reprocess)")
+        return True
+
+    log.info(f"\n{'=' * 60}\nPipeline v3.0: {name}\n{'=' * 60}")
+
+    # Pre-flight: Ollama needed only for the Qwen review pass
+    if config.translation_review:
+        if not check_ollama(config.translation_model, log):
+            return False
+
+    total_duration = get_duration(video_path, log)
+
+    # ── 0. Source separation (Demucs) ─────────────────────────────────────────
+    vocals_wav:    Optional[str] = None
+    no_vocals_wav: Optional[str] = None
+
+    if config.use_demucs:
+        log.info("\n[0/7] SOURCE SEPARATION (Demucs)")
+        vocals_wav, no_vocals_wav = separate_vocals(
+            video_path, temp_dir, config.demucs_model, log
+        )
+
+    # Fallback: extract raw audio if Demucs was disabled or failed
+    if not vocals_wav:
+        log.info("\n[1/7] EXTRACTING AUDIO")
+        raw_wav = os.path.join(temp_dir, f"{name}.wav")
+        if not extract_audio(video_path, raw_wav, config.synthesis_sample_rate, log):
+            return False
+        vocals_wav = raw_wav
+
+    # ── 2. Transcribe ─────────────────────────────────────────────────────────
+    log.info("\n[2/7] TRANSCRIBING (faster-whisper)")
+    segments = transcribe_audio(
+        vocals_wav,
+        config.whisper_model,
+        config.whisper_device,
+        config.whisper_compute_type,
+        config.models_folder,
+        log,
+    )
+    if not segments:
+        return False
+    free_vram(log)
+
+    # ── 2b. Merge into sentence-level chunks ──────────────────────────────────
+    segments = merge_segments(
+        segments,
+        max_gap=config.segment_merge_gap,
+        max_duration=config.segment_merge_max_duration,
+        log=log,
+    )
+
+    # ── 3. Translate (EuroLLM) ────────────────────────────────────────────────
+    log.info("\n[3/7] TRANSLATING (EuroLLM-9B)")
+    segments = translate_segments(
+        segments,
+        config.eurollm_model,
+        config.eurollm_quantize,
+        config.translation_temperature,
+        config.translation_batch_size,
+        log,
+        hf_token=config.huggingface_token,
+    )
+    _verify_translation_quality(segments, log)
+
+    # ── 3b. Review pass (Qwen2.5) ─────────────────────────────────────────────
+    if config.translation_review:
+        log.info("\n[3b/7] REVIEWING TRANSLATIONS (Qwen2.5)")
+        segments = review_translations(
+            segments, config.translation_model, config.translation_temperature, log
+        )
+
+    # ── 4. Extract + denoise speaker reference ────────────────────────────────
+    log.info("\n[4/7] PREPARING SPEAKER REFERENCE")
+    raw_speaker_wav     = os.path.join(temp_dir, "speaker_raw.wav")
+    speaker_wav: Optional[str] = None
+
+    if extract_speaker_sample(
+        vocals_wav,
+        config.tts_speaker_duration,
+        raw_speaker_wav,
+        log,
+        skip_seconds=config.tts_speaker_skip,
+    ):
+        if config.use_deepfilter:
+            denoised_wav = os.path.join(temp_dir, "speaker_denoised.wav")
+            speaker_wav  = denoise_audio(raw_speaker_wav, denoised_wav, log)
+        else:
+            speaker_wav = raw_speaker_wav
+    else:
+        log.warning("Voice cloning disabled — using default VoxCPM2 voice")
+
+    # Reference transcript for VoxCPM2 Ultimate Cloning
+    reference_transcript = _get_reference_transcript(
+        segments,
+        skip_seconds=config.tts_speaker_skip,
+        duration=config.tts_speaker_duration,
+    )
+    if reference_transcript:
+        log.info(f"  Reference transcript ({len(reference_transcript)} chars): "
+                 f"{reference_transcript[:80]}…")
+
+    # ── 5. TTS synthesis (VoxCPM2) ────────────────────────────────────────────
+    log.info("\n[5/7] SYNTHESIZING FRENCH AUDIO (VoxCPM2)")
+    synthesized, actual_sr = synthesize_all_segments(
+        segments,
+        speaker_wav,
+        reference_transcript,
+        config.tts_model,
+        log,
+        cfg_value=config.tts_cfg_value,
+        inference_timesteps=config.tts_inference_timesteps,
+        use_prompt_text=config.tts_use_prompt_text,
+    )
+    if not synthesized:
+        return False
+    free_vram(log)
+
+    # ── 6. Assemble & encode ──────────────────────────────────────────────────
+    log.info("\n[6/7] ASSEMBLING & ENCODING")
+    interim_wav = os.path.join(temp_dir, f"{name}_french.wav")
+
+    if not assemble_and_encode(
+        synthesized,
+        total_duration,
+        interim_wav,
+        final_aac,
+        src_rate=actual_sr,
+        out_rate=config.output_sample_rate,
+        max_stretch=config.tts_max_stretch,
+        temp_dir=temp_dir,
+        log=log,
+    ):
+        return False
+
+    # Optional background re-mix (French vocals + original music/ambience)
+    if config.preserve_background and no_vocals_wav and os.path.exists(no_vocals_wav):
+        remixed_aac = os.path.join(output_dir, f"{name}_french_full.m4a")
+        if remix_with_background(interim_wav, no_vocals_wav, remixed_aac, log):
+            log.info(f"  Full mix (vocals + background): {Path(remixed_aac).name}")
+
+    # ── 7. Subtitles ──────────────────────────────────────────────────────────
+    log.info("\n[7/7] GENERATING SUBTITLES")
+    if config.use_whisperx_alignment:
+        align_srt_with_whisperx(
+            interim_wav, segments, final_srt, log, offset_ms=config.subtitle_offset_ms
+        )
+    else:
+        create_srt(segments, final_srt, log, offset_ms=config.subtitle_offset_ms)
+
+    shutil.rmtree(temp_dir, ignore_errors=True)
+
+    log.info(f"\n{'=' * 60}")
+    log.info(f"DONE: {name}")
+    log.info(f"  Audio : {final_aac}")
+    log.info(f"  Subs  : {final_srt}")
+    log.info(f"{'=' * 60}\n")
+    return True
+
+
+# ============================================================================
+# CLI
+# ============================================================================
+
+@click.command()
+@click.option("--video",      type=click.Path(exists=True), required=True, help="Input MP4")
+@click.option("--output-dir", default="/workspace/outputs",  help="Output directory")
+@click.option("--config", "config_path", default="/workspace/config.yaml",
+              type=click.Path(exists=True), help="Path to config.yaml")
+@click.option("--force", is_flag=True, default=False, help="Overwrite existing outputs")
+def main(video: str, output_dir: str, config_path: str, force: bool) -> None:
+    """Dub a single video to French (audio track + SRT subtitles)."""
+    try:
+        config = load_config(config_path)
+    except Exception as e:
+        print(f"Config error: {e}", file=sys.stderr)
+        sys.exit(1)
+    log     = setup_logging(config.logs_folder, Path(video).stem)
+    success = process_video(video, output_dir, config, log, force=force)
+    sys.exit(0 if success else 1)
+
+
+if __name__ == "__main__":
+    main()
