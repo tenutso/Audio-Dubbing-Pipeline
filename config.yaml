@@ -84,6 +84,17 @@ translation:
   # Supported: fr, es, de, it, pt, nl, pl, ru, ja, ko, zh, ar, tr, hi, vi.
   target_lang: fr
 
+  # Locale variant for the target language.
+  # "fr"    → standard European French (default, no glossary applied)
+  # "fr-ca" → Canadian / Québécois French
+  #   Loads the glossary file below and applies two-stage enforcement:
+  #   1. Prompt injection  — vocabulary hints in every translation batch
+  #   2. Post-processing   — deterministic substitution of 'always' terms
+  #   3. Review pass       — Qwen told to use Québécois register explicitly
+  # Override at runtime with: --locale fr-ca
+  locale: fr
+  glossary_path: /workspace/canadian_glossary.yaml
+
   # Multiplier on the per-segment character budget (1.1 = +10% headroom).
   # Raise toward 1.2 if the dub feels too terse; lower toward 1.0 if French
   # still races.  Effective budget = duration_s × LANG_CPS[lang] × cps_safety.

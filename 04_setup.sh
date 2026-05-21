@@ -520,6 +520,14 @@ else
     log_warn "config.yaml not found in $SCRIPT_DIR"
 fi
 
+# Install Canadian French glossary (always overwrite — it's a vocabulary file, not user config)
+if [[ -f "$SCRIPT_DIR/canadian_glossary.yaml" ]]; then
+    cp "$SCRIPT_DIR/canadian_glossary.yaml" /workspace/canadian_glossary.yaml
+    log_success "canadian_glossary.yaml → /workspace/canadian_glossary.yaml"
+else
+    log_warn "canadian_glossary.yaml not found in $SCRIPT_DIR — Canadian French locale will skip glossary"
+fi
+
 # ── Final Summary ──────────────────────────────────────────────────────────
 
 echo ""

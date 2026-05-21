@@ -162,6 +162,12 @@ class PipelineConfig:
     # HuggingFace token — required for gated models (EuroLLM-9B-Instruct)
     huggingface_token: str = ""
 
+    # Locale and vocabulary enforcement
+    # "fr"    → standard European French (no glossary applied)
+    # "fr-ca" → Canadian/Québécois French (glossary injected + post-processed)
+    locale: str = "fr"
+    glossary_path: str = ""
+
     # Segment merging
     segment_merge_gap: float = 0.8
     segment_merge_max_duration: float = 8.0
@@ -177,6 +183,27 @@ class PipelineConfig:
     output_sample_rate: int = 48000        # Vimeo accepts 48 kHz
 
     timeout_seconds: int = 7200
+
+
+@dataclass
+class GlossaryEntry:
+    en: str
+    fr_ca: str
+    fr_std: str = ""
+    mode: str = "suggest"   # "always" | "suggest"
+    category: str = ""
+    note: str = ""
+
+
+@dataclass
+class Glossary:
+    entries: List[GlossaryEntry]
+    formatting_rules: List[str]
+    inclusive_language: List[str]
+
+    @property
+    def has_content(self) -> bool:
+        return bool(self.entries or self.formatting_rules or self.inclusive_language)
 
 
 def load_config(path: str) -> PipelineConfig:
@@ -224,6 +251,8 @@ def load_config(path: str) -> PipelineConfig:
             t.get("huggingface_token", "")
             or os.environ.get("HF_TOKEN", "")
         ),
+        locale=t.get("locale", "fr"),
+        glossary_path=t.get("glossary_path", ""),
         segment_merge_gap=tts.get("segment_merge_gap", 0.8),
         segment_merge_max_duration=tts.get("segment_merge_max_duration", 8.0),
         use_whisperx_alignment=sub.get("whisperx_alignment", True),
@@ -260,6 +289,149 @@ def free_vram(log: Optional[logging.Logger] = None) -> None:
         if log:
             used_gb = torch.cuda.memory_allocated() / 1e9
             log.debug(f"VRAM after cleanup: {used_gb:.1f} GB")
+
+
+# ============================================================================
+# Glossary — Canadian French vocabulary enforcement
+# ============================================================================
+
+def load_glossary(path: str, log: logging.Logger) -> "Glossary":
+    """Load a YAML glossary file and return a Glossary with terms, formatting rules,
+    and inclusive language rules."""
+    empty = Glossary(entries=[], formatting_rules=[], inclusive_language=[])
+    if not path:
+        return empty
+    if not os.path.exists(path):
+        log.warning(f"Glossary file not found: {path} — continuing without glossary")
+        return empty
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = yaml.safe_load(f)
+        entries = [
+            GlossaryEntry(
+                en=str(t.get("en", "")),
+                fr_ca=str(t.get("fr_ca", "")),
+                fr_std=str(t.get("fr_std", "")),
+                mode=str(t.get("mode", "suggest")),
+                category=str(t.get("category", "")),
+                note=str(t.get("note", "")),
+            )
+            for t in (data.get("terms") or [])
+            if t.get("fr_ca")
+        ]
+        formatting_rules  = [str(r) for r in (data.get("formatting_rules")  or [])]
+        inclusive_language = [str(r) for r in (data.get("inclusive_language") or [])]
+        glossary = Glossary(
+            entries=entries,
+            formatting_rules=formatting_rules,
+            inclusive_language=inclusive_language,
+        )
+        log.info(
+            f"✓ Glossary loaded: {len(entries)} terms, "
+            f"{len(formatting_rules)} formatting rules, "
+            f"{len(inclusive_language)} inclusive language rules ({path})"
+        )
+        return glossary
+    except Exception as e:
+        log.warning(f"Glossary load failed ({e}) — continuing without glossary")
+        return empty
+
+
+def _build_glossary_section(glossary: "Glossary", locale: str) -> str:
+    """Build the full prompt injection block from all three glossary sections."""
+    if locale != "fr-ca" or not glossary.has_content:
+        return ""
+
+    blocks: List[str] = []
+
+    if glossary.entries:
+        lines = ["MANDATORY VOCABULARY — use Québécois/Canadian French forms:"]
+        for e in glossary.entries:
+            line = f"  {e.en} → {e.fr_ca}"
+            if e.fr_std and e.fr_std.lower() != e.fr_ca.lower():
+                line += f"  (NOT: {e.fr_std})"
+            if e.note:
+                line += f"  [{e.note}]"
+            lines.append(line)
+        blocks.append("\n".join(lines))
+
+    if glossary.formatting_rules:
+        lines = ["FORMATTING RULES (Canadian French / CAPS standards):"]
+        for rule in glossary.formatting_rules:
+            lines.append(f"  • {rule}")
+        blocks.append("\n".join(lines))
+
+    if glossary.inclusive_language:
+        lines = ["INCLUSIVE LANGUAGE (CAPS standard — apply to every translation):"]
+        for rule in glossary.inclusive_language:
+            lines.append(f"  • {rule}")
+        blocks.append("\n".join(lines))
+
+    return "\n\n".join(blocks) + "\n"
+
+
+def _match_case(original: str, replacement: str) -> str:
+    """Preserve ALL-CAPS or Title-Case of the matched token in the replacement."""
+    if original.isupper():
+        return replacement.upper()
+    if original and original[0].isupper():
+        return replacement[0].upper() + replacement[1:] if replacement else replacement
+    return replacement
+
+
+def apply_glossary(
+    segments: List[dict],
+    entries: List[GlossaryEntry],
+    log: logging.Logger,
+    text_keys: Tuple[str, ...] = ("text_fr", "text_fr_natural"),
+) -> List[dict]:
+    """Post-process translated segments applying 'always' glossary substitutions.
+
+    'mode: suggest' entries are handled entirely via prompt injection.
+    'mode: always' entries are substituted here deterministically.
+
+    Per entry, substitution order (first match at each position wins):
+      1. fr_std form found in the translation → replaced with fr_ca
+      2. English term left untranslated        → replaced with fr_ca
+    Original token case (Title, ALL-CAPS, lowercase) is preserved.
+    """
+    always = [e for e in entries if e.mode == "always"]
+    if not always:
+        return segments
+
+    out = [dict(s) for s in segments]
+    total_subs = 0
+
+    for seg in out:
+        for key in text_keys:
+            text = seg.get(key)
+            if not text:
+                continue
+            for e in always:
+                if e.fr_std:
+                    new = re.sub(
+                        r"\b" + re.escape(e.fr_std) + r"\b",
+                        lambda m, rep=e.fr_ca: _match_case(m.group(), rep),
+                        text,
+                        flags=re.IGNORECASE,
+                    )
+                    if new != text:
+                        total_subs += 1
+                        text = new
+                if e.en:
+                    new = re.sub(
+                        r"\b" + re.escape(e.en) + r"\b",
+                        lambda m, rep=e.fr_ca: _match_case(m.group(), rep),
+                        text,
+                        flags=re.IGNORECASE,
+                    )
+                    if new != text:
+                        total_subs += 1
+                        text = new
+            seg[key] = text
+
+    log.info(f"✓ Glossary: {total_subs} substitution(s) across {len(out)} segments")
+    return out
 
 
 # ============================================================================
@@ -490,7 +662,7 @@ CRITICAL RULES:
 - Preserve key technical terms and proper nouns.
 - Output ONLY the numbered translations, one per line, same numbering as input.
 - No explanations, notes, or extra commentary.
-
+{glossary_section}
 English segments with budgets:
 {segments}
 
@@ -503,14 +675,14 @@ Preserve meaning, tone, and nuance — readability is the priority, no length li
 
 - Output ONLY the numbered translations, one per line, same numbering as input.
 - No explanations, notes, or extra commentary.
-
+{glossary_section}
 English segments:
 {segments}
 
 {language} translations:"""
 
 _REVIEW_PROMPT = """\
-You are a native {language} expert reviewing dubbed video subtitles.
+You are a native {language} expert reviewing dubbed video subtitles.{locale_note}
 Correct any unnatural phrasing, Anglicisms, grammar errors, or register issues.
 
 CRITICAL CONSTRAINTS:
@@ -520,7 +692,7 @@ CRITICAL CONSTRAINTS:
 - Keep changes minimal — only fix what is actually incorrect.
 - Do NOT add filler words or expand abbreviations.
 - Output only the corrected numbered list, same numbering as input.
-
+{glossary_section}
 {language} subtitles to review:
 {segments}
 
@@ -660,6 +832,7 @@ def translate_segments(
     target_lang: str = "fr",
     cps_safety: float = 1.1,
     natural_pass: bool = True,
+    glossary_section: str = "",
 ) -> List[dict]:
     """Translate with EuroLLM-9B-Instruct using a length-fitted prompt.
 
@@ -710,7 +883,7 @@ def translate_segments(
     for start in tqdm(range(0, len(segments), batch_size), desc=f"Translating fitted ({target_lang})"):
         batch = segments[start : start + batch_size]
         numbered, budgets = _format_fitted_segments(batch, target_lang, cps_safety)
-        prompt = _TRANSLATE_PROMPT.format(language=language, segments=numbered)
+        prompt = _TRANSLATE_PROMPT.format(language=language, segments=numbered, glossary_section=glossary_section)
 
         try:
             response = _llm_generate(llm, tokenizer, prompt, temperature)
@@ -758,7 +931,7 @@ def translate_segments(
                     f"{k + 1}. (MAX {budgets_now[i]} chars) {out[i]['text']}"
                     for k, i in enumerate(batch_ids)
                 )
-                prompt = _TRANSLATE_PROMPT.format(language=language, segments=numbered)
+                prompt = _TRANSLATE_PROMPT.format(language=language, segments=numbered, glossary_section=glossary_section)
                 try:
                     response = _llm_generate(llm, tokenizer, prompt, temperature)
                     candidates = _parse_numbered(response, len(batch_ids))
@@ -779,7 +952,7 @@ def translate_segments(
         for start in tqdm(range(0, len(segments), batch_size), desc=f"Translating natural ({target_lang})"):
             batch = segments[start : start + batch_size]
             numbered = "\n".join(f"{i + 1}. {s['text']}" for i, s in enumerate(batch))
-            prompt = _TRANSLATE_NATURAL_PROMPT.format(language=language, segments=numbered)
+            prompt = _TRANSLATE_NATURAL_PROMPT.format(language=language, segments=numbered, glossary_section=glossary_section)
             try:
                 response = _llm_generate(llm, tokenizer, prompt, 0.0)
                 translations = _parse_numbered(response, len(batch))
@@ -819,15 +992,27 @@ def review_translations(
     log: logging.Logger,
     batch_size: int = 50,
     target_lang: str = "fr",
+    locale: str = "fr",
+    glossary_section: str = "",
 ) -> List[dict]:
     log.info(f"Qwen review pass — {len(segments)} segments …")
     language = _LANG_NAMES.get(target_lang, target_lang.upper())
+    locale_note = (
+        "\nUse Québécois/Canadian French register throughout "
+        "(e.g. courriel, fin de semaine, dîner for lunch, souper for supper)."
+        if locale == "fr-ca" else ""
+    )
     out = [dict(s) for s in segments]
 
     for start in tqdm(range(0, len(segments), batch_size), desc=f"Reviewing ({target_lang})"):
         batch   = segments[start : start + batch_size]
         numbered = "\n".join(f"{i + 1}. {s.get('text_fr', '')}" for i, s in enumerate(batch))
-        prompt = _REVIEW_PROMPT.format(language=language, segments=numbered)
+        prompt = _REVIEW_PROMPT.format(
+            language=language,
+            segments=numbered,
+            locale_note=locale_note,
+            glossary_section=glossary_section,
+        )
         response = _ollama_call(prompt, model, temperature, log)
         if response:
             corrected = _parse_numbered(response, len(batch))
@@ -848,6 +1033,7 @@ def translate_segments_qwen(
     target_lang: str = "fr",
     cps_safety: float = 1.1,
     natural_pass: bool = True,
+    glossary_section: str = "",
 ) -> List[dict]:
     """Translate using Qwen via Ollama as the primary translation engine.
 
@@ -868,7 +1054,7 @@ def translate_segments_qwen(
     for start in tqdm(range(0, len(segments), batch_size), desc=f"Translating fitted ({target_lang})"):
         batch = segments[start : start + batch_size]
         numbered, budgets = _format_fitted_segments(batch, target_lang, cps_safety)
-        prompt = think_prefix + _TRANSLATE_PROMPT.format(language=language, segments=numbered)
+        prompt = think_prefix + _TRANSLATE_PROMPT.format(language=language, segments=numbered, glossary_section=glossary_section)
         response = _ollama_call(prompt, model, temperature, log)
         if response:
             translations = _parse_numbered(response, len(batch))
@@ -911,7 +1097,7 @@ def translate_segments_qwen(
                     f"{k + 1}. (MAX {budgets_now[i]} chars) {out[i]['text']}"
                     for k, i in enumerate(batch_ids)
                 )
-                prompt = think_prefix + _TRANSLATE_PROMPT.format(language=language, segments=numbered)
+                prompt = think_prefix + _TRANSLATE_PROMPT.format(language=language, segments=numbered, glossary_section=glossary_section)
                 response = _ollama_call(prompt, model, temperature, log)
                 if response:
                     candidates = _parse_numbered(response, len(batch_ids))
@@ -930,7 +1116,7 @@ def translate_segments_qwen(
         for start in tqdm(range(0, len(segments), batch_size), desc=f"Translating natural ({target_lang})"):
             batch = segments[start : start + batch_size]
             numbered = "\n".join(f"{i + 1}. {s['text']}" for i, s in enumerate(batch))
-            prompt = think_prefix + _TRANSLATE_NATURAL_PROMPT.format(language=language, segments=numbered)
+            prompt = think_prefix + _TRANSLATE_NATURAL_PROMPT.format(language=language, segments=numbered, glossary_section=glossary_section)
             response = _ollama_call(prompt, model, 0.0, log)
             if response:
                 translations = _parse_numbered(response, len(batch))
@@ -1557,6 +1743,19 @@ def process_video(
         if not check_ollama(config.translation_model, log):
             return False
 
+    # Load glossary (Canadian French vocabulary + formatting + inclusive language)
+    glossary = load_glossary(config.glossary_path, log) if config.locale == "fr-ca" else Glossary([], [], [])
+    glossary_section = _build_glossary_section(glossary, config.locale)
+    if glossary.has_content:
+        always_n  = sum(1 for e in glossary.entries if e.mode == "always")
+        suggest_n = sum(1 for e in glossary.entries if e.mode == "suggest")
+        log.info(
+            f"  Locale: {config.locale} — {always_n} always-substitute, "
+            f"{suggest_n} suggest-only terms, "
+            f"{len(glossary.formatting_rules)} formatting rules, "
+            f"{len(glossary.inclusive_language)} inclusive language rules"
+        )
+
     total_duration = get_duration(video_path, log)
 
     # ── 0. Source separation (Demucs) ─────────────────────────────────────────
@@ -1611,6 +1810,7 @@ def process_video(
             target_lang=config.target_lang,
             cps_safety=config.cps_safety,
             natural_pass=config.translate_natural_pass,
+            glossary_section=glossary_section,
         )
     else:
         log.info("\n[3/7] TRANSLATING (EuroLLM-9B)")
@@ -1625,6 +1825,7 @@ def process_video(
             target_lang=config.target_lang,
             cps_safety=config.cps_safety,
             natural_pass=config.translate_natural_pass,
+            glossary_section=glossary_section,
         )
     _verify_translation_quality(segments, log)
 
@@ -1640,7 +1841,14 @@ def process_video(
             config.translation_temperature,
             log,
             target_lang=config.target_lang,
+            locale=config.locale,
+            glossary_section=glossary_section,
         )
+
+    # ── 3c. Glossary post-processing (Canadian French enforcement) ─────────────
+    if glossary.entries:
+        log.info("\n[3c/7] APPLYING GLOSSARY (deterministic substitution)")
+        segments = apply_glossary(segments, glossary.entries, log)
 
     # ── 4. Extract + denoise speaker reference ────────────────────────────────
     log.info("\n[4/7] PREPARING SPEAKER REFERENCE")
@@ -1763,12 +1971,26 @@ def process_video(
         "Defaults to translation.backend in config.yaml."
     ),
 )
-def main(video: str, output_dir: str, config_path: str, force: bool, translator: Optional[str]) -> None:
+@click.option(
+    "--locale",
+    type=click.Choice(["fr", "fr-ca"], case_sensitive=False),
+    default=None,
+    help=(
+        "Output language locale. "
+        "'fr-ca' loads the Canadian French glossary and enforces Québécois vocabulary "
+        "via prompt injection and post-processing substitution. "
+        "Defaults to translation.locale in config.yaml."
+    ),
+)
+def main(video: str, output_dir: str, config_path: str, force: bool, translator: Optional[str], locale: Optional[str]) -> None:
     """Dub a single video to French (audio track + SRT subtitles).
 
     Compare backends:
       --translator eurollm --output-dir /workspace/outputs/eurollm
       --translator qwen     --output-dir /workspace/outputs/qwen
+
+    Canadian French:
+      --locale fr-ca
     """
     try:
         config = load_config(config_path)
@@ -1777,6 +1999,8 @@ def main(video: str, output_dir: str, config_path: str, force: bool, translator:
         sys.exit(1)
     if translator:
         config.translation_backend = translator.lower()
+    if locale:
+        config.locale = locale.lower()
     log     = setup_logging(config.logs_folder, Path(video).stem)
     success = process_video(video, output_dir, config, log, force=force)
     sys.exit(0 if success else 1)
