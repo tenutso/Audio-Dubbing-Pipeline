@@ -662,7 +662,7 @@ def diarize_audio(
 
     try:
         log.info(f"Loading diarization model: {model_name} …")
-        pipeline = PyannotePipeline.from_pretrained(model_name, use_auth_token=hf_token)
+        pipeline = PyannotePipeline.from_pretrained(model_name, token=hf_token)
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         pipeline.to(device)
 
