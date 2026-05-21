@@ -21,6 +21,26 @@ audio:
   output_sample_rate: 48000
 
 # ============================================================
+# Speaker Diarization — pyannote.audio (optional)
+# Detects who is speaking when and builds a separate voice-clone
+# reference for each speaker, so every voice is dubbed distinctly.
+# Requires: pip install pyannote.audio
+# The HF token (translation.huggingface_token or $HF_TOKEN) must
+# have accepted the model license:
+#   https://huggingface.co/pyannote/speaker-diarization-3.1
+# ============================================================
+diarization:
+  enabled: false
+  model: pyannote/speaker-diarization-3.1
+  # Hint the expected speaker range — improves diarization accuracy.
+  # Set both to the same number to force an exact speaker count.
+  min_speakers: 1
+  max_speakers: 10
+  # Seconds of each speaker's audio to assemble for their voice clone.
+  # Drawn from their longest utterances, not a fixed time window.
+  profile_duration: 25
+
+# ============================================================
 # Source Separation — Demucs
 # Separates speaker vocals from background music/noise before
 # transcription and voice cloning.  Cleaner input → better

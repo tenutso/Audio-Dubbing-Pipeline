@@ -130,6 +130,13 @@ class PipelineConfig:
     demucs_model: str = "htdemucs"
     preserve_background: bool = True
 
+    # Diarization — pyannote.audio (optional, requires HF token)
+    use_diarization: bool = False
+    diarization_model: str = "pyannote/speaker-diarization-3.1"
+    diarization_min_speakers: int = 1
+    diarization_max_speakers: int = 10
+    diarization_profile_duration: float = 25.0   # seconds of audio to collect per speaker
+
     # Translation — EuroLLM primary, Qwen review (or Qwen primary via --translator)
     eurollm_model: str = "utter-project/EuroLLM-9B-Instruct"
     eurollm_quantize: bool = True          # 8-bit to save VRAM (~9 GB vs ~18 GB)
@@ -231,6 +238,11 @@ def load_config(path: str) -> PipelineConfig:
         use_demucs=sep.get("enabled", True),
         demucs_model=sep.get("model", "htdemucs"),
         preserve_background=sep.get("preserve_background", True),
+        use_diarization=c.get("diarization", {}).get("enabled", False),
+        diarization_model=c.get("diarization", {}).get("model", "pyannote/speaker-diarization-3.1"),
+        diarization_min_speakers=c.get("diarization", {}).get("min_speakers", 1),
+        diarization_max_speakers=c.get("diarization", {}).get("max_speakers", 10),
+        diarization_profile_duration=c.get("diarization", {}).get("profile_duration", 25.0),
         eurollm_model=t.get("eurollm_model", "utter-project/EuroLLM-9B-Instruct"),
         eurollm_quantize=t.get("eurollm_quantize", True),
         translation_model=t.get("model", "qwen3:14b"),
@@ -618,6 +630,158 @@ def merge_segments(
 
     log.info(f"✓ Merged {len(segments)} Whisper segments → {len(merged)} sentence-level chunks")
     return merged
+
+
+# ============================================================================
+# Step 2c: Speaker Diarization — pyannote.audio (optional)
+# ============================================================================
+
+def diarize_audio(
+    wav_path: str,
+    model_name: str,
+    hf_token: str,
+    min_speakers: int,
+    max_speakers: int,
+    log: logging.Logger,
+) -> Optional[List[Tuple[float, float, str]]]:
+    """Run pyannote.audio speaker diarization on a mono WAV file.
+
+    Returns a list of (start_s, end_s, speaker_label) tuples, or None on failure.
+    Requires: pip install pyannote.audio
+    The HF token must have accepted the model license at:
+      https://huggingface.co/pyannote/speaker-diarization-3.1
+    """
+    try:
+        from pyannote.audio import Pipeline as PyannotePipeline
+    except ImportError:
+        log.error(
+            "pyannote.audio not installed.\n"
+            "  Fix: pip install pyannote.audio"
+        )
+        return None
+
+    try:
+        log.info(f"Loading diarization model: {model_name} …")
+        pipeline = PyannotePipeline.from_pretrained(model_name, use_auth_token=hf_token)
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        pipeline.to(device)
+
+        diarize_kwargs: dict = {}
+        if min_speakers > 1:
+            diarize_kwargs["min_speakers"] = min_speakers
+        if max_speakers < 50:
+            diarize_kwargs["max_speakers"] = max_speakers
+
+        log.info("Running speaker diarization …")
+        annotation = pipeline(wav_path, **diarize_kwargs)
+
+        turns = [
+            (turn.start, turn.end, speaker)
+            for turn, _, speaker in annotation.itertracks(yield_label=True)
+        ]
+        speaker_ids = sorted({t[2] for t in turns})
+        log.info(f"✓ Diarization complete — {len(speaker_ids)} speaker(s): {speaker_ids}")
+        del pipeline
+        free_vram(log)
+        return turns
+
+    except Exception as e:
+        log.error(f"Diarization failed: {e}")
+        return None
+
+
+def assign_speakers(
+    segments: List[dict],
+    turns: List[Tuple[float, float, str]],
+) -> List[dict]:
+    """Tag each segment with the speaker that occupies the most of its duration."""
+    out = [dict(s) for s in segments]
+    for seg in out:
+        seg_start, seg_end = seg["start"], seg["end"]
+        best_spk, best_overlap = "SPEAKER_00", 0.0
+        for (t_start, t_end, speaker) in turns:
+            if t_end <= seg_start or t_start >= seg_end:
+                continue
+            overlap = min(t_end, seg_end) - max(t_start, seg_start)
+            if overlap > best_overlap:
+                best_overlap, best_spk = overlap, speaker
+        seg["speaker"] = best_spk
+    return out
+
+
+def build_speaker_profiles(
+    vocals_wav: str,
+    segments: List[dict],
+    temp_dir: str,
+    profile_duration: float,
+    log: logging.Logger,
+    use_deepfilter: bool = True,
+) -> dict:
+    """Build a per-speaker voice-clone reference clip.
+
+    Collects each speaker's longest utterances (up to profile_duration seconds),
+    concatenates them, resamples to 16 kHz (VoxCPM2 input spec), and optionally
+    denoises. Returns {speaker_id: wav_path} — value is None when a speaker has
+    fewer than 3 s of usable audio.
+    """
+    from collections import defaultdict
+
+    TARGET_SR = 16000
+    MIN_PROFILE_S = 3.0
+
+    by_speaker: dict = defaultdict(list)
+    for seg in segments:
+        spk = seg.get("speaker", "SPEAKER_00")
+        by_speaker[spk].append(seg)
+
+    log.info(f"  Loading vocals at {TARGET_SR} Hz for profile extraction …")
+    try:
+        full_audio, _ = librosa.load(vocals_wav, sr=TARGET_SR, mono=True)
+    except Exception as e:
+        log.error(f"Cannot load vocals for speaker profiles: {e}")
+        return {}
+
+    total_s = len(full_audio) / TARGET_SR
+    profiles: dict = {}
+
+    for speaker, spk_segs in by_speaker.items():
+        # Longest segments first — maximises voice fidelity per second collected
+        spk_segs = sorted(spk_segs, key=lambda s: s["end"] - s["start"], reverse=True)
+        chunks: List[np.ndarray] = []
+        collected = 0.0
+
+        for seg in spk_segs:
+            if collected >= profile_duration:
+                break
+            s_start = max(0.0, float(seg["start"]))
+            s_end   = min(total_s, float(seg["end"]))
+            dur     = s_end - s_start
+            if dur < 0.5:
+                continue
+            want      = min(dur, profile_duration - collected)
+            idx_start = int(s_start * TARGET_SR)
+            idx_end   = int((s_start + want) * TARGET_SR)
+            chunks.append(full_audio[idx_start:idx_end])
+            collected += want
+
+        if not chunks or collected < MIN_PROFILE_S:
+            log.warning(f"  {speaker}: only {collected:.1f}s available — skipping profile (need ≥{MIN_PROFILE_S}s)")
+            profiles[speaker] = None
+            continue
+
+        combined = np.concatenate(chunks)
+        raw_path = os.path.join(temp_dir, f"profile_{speaker}_raw.wav")
+        sf.write(raw_path, combined, TARGET_SR)
+
+        if use_deepfilter:
+            denoised_path = os.path.join(temp_dir, f"profile_{speaker}_denoised.wav")
+            profiles[speaker] = denoise_audio(raw_path, denoised_path, log)
+        else:
+            profiles[speaker] = raw_path
+
+        log.info(f"  {speaker}: {collected:.1f}s profile built → {profiles[speaker]}")
+
+    return profiles
 
 
 # ============================================================================
@@ -1468,16 +1632,25 @@ def synthesize_all_segments(
     cfg_value: float = 2.5,
     inference_timesteps: int = 24,
     use_prompt_text: bool = False,
+    speaker_profiles: Optional[dict] = None,
 ) -> Tuple[List[Tuple[np.ndarray, float, float]], int]:
     """Synthesize French audio using VoxCPM2 Ultimate Cloning.
 
-    Ultimate Cloning mode passes both the reference audio clip AND its English
-    transcript, giving VoxCPM2 maximum information to reproduce the speaker's
-    voice while synthesizing in French.
+    When speaker_profiles is provided (multi-speaker diarization mode), each
+    segment is synthesized with its assigned speaker's voice clone. Falls back
+    to speaker_wav for segments whose speaker has no usable profile.
 
     Returns (synthesized_segments, sample_rate_hz).
     Falls back to Coqui XTTS v2 if voxcpm is not installed.
     """
+    def _pick_wav(seg: dict) -> Optional[str]:
+        if speaker_profiles:
+            spk = seg.get("speaker", "SPEAKER_00")
+            profile = speaker_profiles.get(spk)
+            if profile and os.path.exists(profile):
+                return profile
+        return speaker_wav
+
     # ── VoxCPM2 ──────────────────────────────────────────────────────────────
     try:
         from voxcpm import VoxCPM
@@ -1496,6 +1669,7 @@ def synthesize_all_segments(
                     pbar.update(1)
                     continue
                 try:
+                    ref_wav = _pick_wav(seg)
                     kwargs: dict = {
                         "text": text,
                         "cfg_value": cfg_value,
@@ -1506,8 +1680,8 @@ def synthesize_all_segments(
                         "retry_badcase": True,
                         "retry_badcase_max_times": 3,
                     }
-                    if speaker_wav and os.path.exists(speaker_wav):
-                        kwargs["reference_wav_path"] = speaker_wav
+                    if ref_wav and os.path.exists(ref_wav):
+                        kwargs["reference_wav_path"] = ref_wav
                         if use_prompt_text and reference_transcript:
                             kwargs["prompt_text"] = reference_transcript
                     wav = model.generate(**kwargs)
@@ -1546,9 +1720,10 @@ def synthesize_all_segments(
                 pbar.update(1)
                 continue
             try:
+                ref_wav = _pick_wav(seg)
                 kwargs = {"text": text[:220], "language": "fr", "speed": 1.0}
-                if speaker_wav and os.path.exists(speaker_wav):
-                    kwargs["speaker_wav"] = speaker_wav
+                if ref_wav and os.path.exists(ref_wav):
+                    kwargs["speaker_wav"] = ref_wav
                 wav = np.array(tts.tts(**kwargs), dtype=np.float32)
                 synthesized.append((wav, seg["start"], seg["end"]))
             except Exception as e:
@@ -2003,6 +2178,30 @@ def process_video(
         log=log,
     )
 
+    # ── 2c. Speaker diarization (optional) ────────────────────────────────────
+    if config.use_diarization:
+        log.info("\n[2c/7] SPEAKER DIARIZATION (pyannote.audio)")
+        turns = diarize_audio(
+            vocals_wav,
+            config.diarization_model,
+            config.huggingface_token,
+            config.diarization_min_speakers,
+            config.diarization_max_speakers,
+            log,
+        )
+        if turns:
+            segments = assign_speakers(segments, turns)
+            speaker_counts = {}
+            for seg in segments:
+                spk = seg.get("speaker", "?")
+                speaker_counts[spk] = speaker_counts.get(spk, 0) + 1
+            for spk, n in sorted(speaker_counts.items()):
+                log.info(f"  {spk}: {n} segment(s)")
+        else:
+            log.warning("  Diarization failed — all segments assigned to SPEAKER_00")
+            for seg in segments:
+                seg["speaker"] = "SPEAKER_00"
+
     # ── 3. Translate ──────────────────────────────────────────────────────────
     if config.translation_backend == "qwen":
         log.info(f"\n[3/7] TRANSLATING ({config.translation_model} via Ollama)")
@@ -2083,25 +2282,49 @@ def process_video(
         log.info("\n[3c/7] APPLYING GLOSSARY (deterministic substitution)")
         segments = apply_glossary(segments, glossary.entries, log)
 
-    # ── 4. Extract + denoise speaker reference ────────────────────────────────
-    log.info("\n[4/7] PREPARING SPEAKER REFERENCE")
-    raw_speaker_wav     = os.path.join(temp_dir, "speaker_raw.wav")
+    # ── 4. Prepare speaker voice reference(s) ─────────────────────────────────
+    log.info("\n[4/7] PREPARING SPEAKER REFERENCE(S)")
     speaker_wav: Optional[str] = None
+    speaker_profiles: Optional[dict] = None
 
-    if extract_speaker_sample(
-        vocals_wav,
-        config.tts_speaker_duration,
-        raw_speaker_wav,
-        log,
-        skip_seconds=config.tts_speaker_skip,
-    ):
-        if config.use_deepfilter:
-            denoised_wav = os.path.join(temp_dir, "speaker_denoised.wav")
-            speaker_wav  = denoise_audio(raw_speaker_wav, denoised_wav, log)
-        else:
-            speaker_wav = raw_speaker_wav
+    if config.use_diarization and any("speaker" in s for s in segments):
+        # Multi-speaker: build a profile clip for every detected speaker
+        speaker_profiles = build_speaker_profiles(
+            vocals_wav,
+            segments,
+            temp_dir,
+            config.diarization_profile_duration,
+            log,
+            use_deepfilter=config.use_deepfilter,
+        )
+        valid = sum(1 for v in speaker_profiles.values() if v)
+        log.info(f"  Built {valid}/{len(speaker_profiles)} speaker profile(s)")
+        # Also build a single fallback wav for speakers with insufficient audio
+        raw_speaker_wav = os.path.join(temp_dir, "speaker_raw.wav")
+        if extract_speaker_sample(
+            vocals_wav, config.tts_speaker_duration, raw_speaker_wav, log,
+            skip_seconds=config.tts_speaker_skip,
+        ):
+            speaker_wav = denoise_audio(
+                raw_speaker_wav, os.path.join(temp_dir, "speaker_denoised.wav"), log
+            ) if config.use_deepfilter else raw_speaker_wav
     else:
-        log.warning("Voice cloning disabled — using default VoxCPM2 voice")
+        # Single-speaker (original path)
+        raw_speaker_wav = os.path.join(temp_dir, "speaker_raw.wav")
+        if extract_speaker_sample(
+            vocals_wav,
+            config.tts_speaker_duration,
+            raw_speaker_wav,
+            log,
+            skip_seconds=config.tts_speaker_skip,
+        ):
+            if config.use_deepfilter:
+                denoised_wav = os.path.join(temp_dir, "speaker_denoised.wav")
+                speaker_wav  = denoise_audio(raw_speaker_wav, denoised_wav, log)
+            else:
+                speaker_wav = raw_speaker_wav
+        else:
+            log.warning("Voice cloning disabled — using default VoxCPM2 voice")
 
     # Reference transcript for VoxCPM2 Ultimate Cloning
     reference_transcript = _get_reference_transcript(
@@ -2124,6 +2347,7 @@ def process_video(
         cfg_value=config.tts_cfg_value,
         inference_timesteps=config.tts_inference_timesteps,
         use_prompt_text=config.tts_use_prompt_text,
+        speaker_profiles=speaker_profiles,
     )
     if not synthesized:
         return False
