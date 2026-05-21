@@ -130,10 +130,11 @@ class PipelineConfig:
     demucs_model: str = "htdemucs"
     preserve_background: bool = True
 
-    # Translation — EuroLLM primary, Qwen review
+    # Translation — EuroLLM primary, Qwen review (or Qwen primary via --translator)
     eurollm_model: str = "utter-project/EuroLLM-9B-Instruct"
     eurollm_quantize: bool = True          # 8-bit to save VRAM (~9 GB vs ~18 GB)
-    translation_model: str = "qwen2.5:14b" # Ollama — review pass only
+    translation_model: str = "qwen3:14b"   # Ollama — review pass or primary backend
+    translation_backend: str = "eurollm"   # "eurollm" | "qwen"
     translation_temperature: float = 0.3
     translation_batch_size: int = 10
     translation_review: bool = True
@@ -203,7 +204,8 @@ def load_config(path: str) -> PipelineConfig:
         preserve_background=sep.get("preserve_background", True),
         eurollm_model=t.get("eurollm_model", "utter-project/EuroLLM-9B-Instruct"),
         eurollm_quantize=t.get("eurollm_quantize", True),
-        translation_model=t.get("model", "qwen2.5:14b"),
+        translation_model=t.get("model", "qwen3:14b"),
+        translation_backend=t.get("backend", "eurollm"),
         translation_temperature=t.get("temperature", 0.3),
         translation_batch_size=t.get("batch_size", 10),
         translation_review=t.get("review_pass", True),
@@ -591,6 +593,8 @@ def _ollama_call(prompt: str, model: str, temperature: float, log: logging.Logge
 
 
 def _parse_numbered(text: str, count: int) -> List[str]:
+    # Strip Qwen3 chain-of-thought blocks emitted when /no_think isn't honoured
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
     result: dict = {}
     for line in text.splitlines():
         m = re.match(r"^[\(\[]?(\d+)[\.\)\]]\s+(.*)", line.strip())
@@ -832,6 +836,124 @@ def review_translations(
                     out[start + i]["text_fr"] = corrected[i]
 
     log.info("✓ Review complete")
+    return out
+
+
+def translate_segments_qwen(
+    segments: List[dict],
+    model: str,
+    temperature: float,
+    batch_size: int,
+    log: logging.Logger,
+    target_lang: str = "fr",
+    cps_safety: float = 1.1,
+    natural_pass: bool = True,
+) -> List[dict]:
+    """Translate using Qwen via Ollama as the primary translation engine.
+
+    Mirrors the EuroLLM translate_segments logic but uses Ollama instead of an
+    on-GPU HuggingFace model — no VRAM consumed during translation.
+    Qwen3's thinking mode is suppressed via /no_think prefix; any residual
+    <think> blocks are stripped in _parse_numbered before parsing.
+    """
+    language = _LANG_NAMES.get(target_lang, target_lang.upper())
+    out = [dict(s) for s in segments]
+    # Qwen3 enables chain-of-thought by default; /no_think turns it off so
+    # we get clean numbered output without <think>...</think> wrapping
+    think_prefix = "/no_think\n" if "qwen3" in model.lower() else ""
+
+    log.info(f"Translating with {model} (Ollama) as primary engine …")
+
+    # ── Pass 1: fitted batched translation ────────────────────────────────────
+    for start in tqdm(range(0, len(segments), batch_size), desc=f"Translating fitted ({target_lang})"):
+        batch = segments[start : start + batch_size]
+        numbered, budgets = _format_fitted_segments(batch, target_lang, cps_safety)
+        prompt = think_prefix + _TRANSLATE_PROMPT.format(language=language, segments=numbered)
+        response = _ollama_call(prompt, model, temperature, log)
+        if response:
+            translations = _parse_numbered(response, len(batch))
+            for i, seg in enumerate(batch):
+                out[start + i]["text_fr"] = translations[i] or seg["text"]
+                out[start + i]["_budget"] = budgets[i]
+        else:
+            for i, seg in enumerate(batch):
+                out[start + i]["text_fr"] = seg["text"]
+                out[start + i]["_budget"] = budgets[i]
+
+    # ── Pass 2: batched overflow retry with progressively tighter budgets ────
+    OVERFLOW_FACTOR = 1.4
+    MAX_RETRIES = 3
+
+    def _overflow(seg: dict) -> bool:
+        budget = seg.get("_budget", _budget_chars(seg, target_lang, cps_safety))
+        return len(seg.get("text_fr", "")) > budget * OVERFLOW_FACTOR
+
+    remaining = [i for i, s in enumerate(out) if _overflow(s)]
+
+    if not remaining:
+        log.info("  No segments overflow the CPS budget — skipping retry pass")
+    else:
+        log.info(f"  {len(remaining)}/{len(out)} segments overflow — batched retry with tighter budgets")
+        budgets_now = {i: out[i].get("_budget", _budget_chars(out[i], target_lang, cps_safety)) for i in remaining}
+
+        for attempt in range(1, MAX_RETRIES + 1):
+            if not remaining:
+                break
+            for i in remaining:
+                budgets_now[i] = max(20, int(budgets_now[i] * 0.7))
+
+            for start in tqdm(
+                range(0, len(remaining), batch_size),
+                desc=f"Retry pass {attempt}/{MAX_RETRIES} ({len(remaining)} segs)",
+            ):
+                batch_ids = remaining[start : start + batch_size]
+                numbered = "\n".join(
+                    f"{k + 1}. (MAX {budgets_now[i]} chars) {out[i]['text']}"
+                    for k, i in enumerate(batch_ids)
+                )
+                prompt = think_prefix + _TRANSLATE_PROMPT.format(language=language, segments=numbered)
+                response = _ollama_call(prompt, model, temperature, log)
+                if response:
+                    candidates = _parse_numbered(response, len(batch_ids))
+                    for k, i in enumerate(batch_ids):
+                        if candidates[k]:
+                            out[i]["text_fr"] = candidates[k]
+
+            remaining = [i for i in remaining if _overflow(out[i])]
+            log.info(f"  After retry pass {attempt}: {len(remaining)} segments still overflow")
+
+        if remaining:
+            log.info(f"  {len(remaining)} segments did not converge — natural-pass fallback will handle them")
+
+    # ── Pass 3: optional natural (unconstrained) translation for SRT ─────────
+    if natural_pass:
+        for start in tqdm(range(0, len(segments), batch_size), desc=f"Translating natural ({target_lang})"):
+            batch = segments[start : start + batch_size]
+            numbered = "\n".join(f"{i + 1}. {s['text']}" for i, s in enumerate(batch))
+            prompt = think_prefix + _TRANSLATE_NATURAL_PROMPT.format(language=language, segments=numbered)
+            response = _ollama_call(prompt, model, 0.0, log)
+            if response:
+                translations = _parse_numbered(response, len(batch))
+                for i, seg in enumerate(batch):
+                    out[start + i]["text_fr_natural"] = translations[i] or out[start + i].get("text_fr", seg["text"])
+            else:
+                for i in range(len(batch)):
+                    out[start + i]["text_fr_natural"] = out[start + i].get("text_fr", batch[i]["text"])
+
+        salvaged = 0
+        for seg in out:
+            budget = seg.get("_budget", _budget_chars(seg, target_lang, cps_safety))
+            if (
+                len(seg.get("text_fr", "")) > budget * OVERFLOW_FACTOR
+                and seg.get("text_fr_natural")
+                and len(seg["text_fr_natural"]) < len(seg["text_fr"])
+            ):
+                seg["text_fr"] = seg["text_fr_natural"]
+                salvaged += 1
+        if salvaged:
+            log.info(f"  Used natural fallback for {salvaged} stubborn segment(s)")
+
+    log.info(f"✓ Qwen translation complete ({target_lang})")
     return out
 
 
@@ -1430,8 +1552,8 @@ def process_video(
 
     log.info(f"\n{'=' * 60}\nPipeline v3.0: {name}\n{'=' * 60}")
 
-    # Pre-flight: Ollama needed only for the Qwen review pass
-    if config.translation_review:
+    # Pre-flight: Ollama needed for Qwen backend or the Qwen review pass
+    if config.translation_backend == "qwen" or config.translation_review:
         if not check_ollama(config.translation_model, log):
             return False
 
@@ -1477,25 +1599,41 @@ def process_video(
         log=log,
     )
 
-    # ── 3. Translate (EuroLLM) ────────────────────────────────────────────────
-    log.info("\n[3/7] TRANSLATING (EuroLLM-9B)")
-    segments = translate_segments(
-        segments,
-        config.eurollm_model,
-        config.eurollm_quantize,
-        config.translation_temperature,
-        config.translation_batch_size,
-        log,
-        hf_token=config.huggingface_token,
-        target_lang=config.target_lang,
-        cps_safety=config.cps_safety,
-        natural_pass=config.translate_natural_pass,
-    )
+    # ── 3. Translate ──────────────────────────────────────────────────────────
+    if config.translation_backend == "qwen":
+        log.info(f"\n[3/7] TRANSLATING ({config.translation_model} via Ollama)")
+        segments = translate_segments_qwen(
+            segments,
+            config.translation_model,
+            config.translation_temperature,
+            config.translation_batch_size,
+            log,
+            target_lang=config.target_lang,
+            cps_safety=config.cps_safety,
+            natural_pass=config.translate_natural_pass,
+        )
+    else:
+        log.info("\n[3/7] TRANSLATING (EuroLLM-9B)")
+        segments = translate_segments(
+            segments,
+            config.eurollm_model,
+            config.eurollm_quantize,
+            config.translation_temperature,
+            config.translation_batch_size,
+            log,
+            hf_token=config.huggingface_token,
+            target_lang=config.target_lang,
+            cps_safety=config.cps_safety,
+            natural_pass=config.translate_natural_pass,
+        )
     _verify_translation_quality(segments, log)
 
-    # ── 3b. Review pass (Qwen2.5) ─────────────────────────────────────────────
+    # ── 3b. Review pass (Qwen) ────────────────────────────────────────────────
     if config.translation_review:
-        log.info("\n[3b/7] REVIEWING TRANSLATIONS (Qwen2.5)")
+        if config.translation_backend == "qwen":
+            log.info(f"\n[3b/7] REVIEWING TRANSLATIONS ({config.translation_model} — self-review)")
+        else:
+            log.info(f"\n[3b/7] REVIEWING TRANSLATIONS ({config.translation_model})")
         segments = review_translations(
             segments,
             config.translation_model,
@@ -1614,13 +1752,31 @@ def process_video(
 @click.option("--config", "config_path", default="/workspace/config.yaml",
               type=click.Path(exists=True), help="Path to config.yaml")
 @click.option("--force", is_flag=True, default=False, help="Overwrite existing outputs")
-def main(video: str, output_dir: str, config_path: str, force: bool) -> None:
-    """Dub a single video to French (audio track + SRT subtitles)."""
+@click.option(
+    "--translator",
+    type=click.Choice(["eurollm", "qwen"], case_sensitive=False),
+    default=None,
+    help=(
+        "Translation backend override. "
+        "'eurollm' = EuroLLM-9B-Instruct on-GPU (gated HF model, best quality). "
+        "'qwen' = Qwen3:14b via Ollama (no HF token needed, good for comparison). "
+        "Defaults to translation.backend in config.yaml."
+    ),
+)
+def main(video: str, output_dir: str, config_path: str, force: bool, translator: Optional[str]) -> None:
+    """Dub a single video to French (audio track + SRT subtitles).
+
+    Compare backends:
+      --translator eurollm --output-dir /workspace/outputs/eurollm
+      --translator qwen     --output-dir /workspace/outputs/qwen
+    """
     try:
         config = load_config(config_path)
     except Exception as e:
         print(f"Config error: {e}", file=sys.stderr)
         sys.exit(1)
+    if translator:
+        config.translation_backend = translator.lower()
     log     = setup_logging(config.logs_folder, Path(video).stem)
     success = process_video(video, output_dir, config, log, force=force)
     sys.exit(0 if success else 1)

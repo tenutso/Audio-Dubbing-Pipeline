@@ -1,7 +1,13 @@
 {
   "permissions": {
     "allow": [
-      "Bash(wsl python3 *)"
+      "Bash(wsl python3 *)",
+      "Read(//home/anijmeh/projects/dubbing/**)",
+      "Read(///wsl.localhost/Ubuntu/home/anijmeh/projects/dubbing/**)"
+    ],
+    "additionalDirectories": [
+      "\\home\\anijmeh\\projects\\dubbing",
+      "\\\\wsl.localhost\\Ubuntu\\home\\anijmeh\\projects\\dubbing"
     ]
   }
 }

@@ -9,7 +9,7 @@
 # A final summary lists every error and warning.
 
 set -uo pipefail
-
+set PYTHONUTF8=1
 # ── Colour helpers ────────────────────────────────────────────────────────
 GREEN='\033[0;32m'; YELLOW='\033[1;33m'; RED='\033[0;31m'; NC='\033[0m'
 ERRORS=(); WARNINGS=()
@@ -262,7 +262,7 @@ fi
 # so it's active for all subsequent pre-downloads and pipeline runs.
 export HF_HUB_ENABLE_HF_TRANSFER=1
 grep -q "HF_HUB_ENABLE_HF_TRANSFER" /workspace/.env 2>/dev/null \
-    || echo "export HF_HUB_ENABLE_HF_TRANSFER=1" >> /workspace/.env
+    || echo "HF_HUB_ENABLE_HF_TRANSFER=1" >> /workspace/.env
 
 # ── Step 10: Ollama ───────────────────────────────────────────────────────
 
@@ -320,9 +320,9 @@ pull_with_retry() {
 }
 
 if curl -s http://localhost:11434/api/tags > /dev/null 2>&1; then
-    pull_with_retry "qwen2.5:14b"
+    pull_with_retry "qwen3:14b"
 else
-    log_warn "Ollama not reachable — skipping model download. Run: ollama pull qwen2.5:14b"
+    log_warn "Ollama not reachable — skipping model download. Run: ollama pull qwen3:14b"
 fi
 
 # ── Step 12b: HuggingFace token (EuroLLM-9B is a gated model) ────────────────
@@ -348,10 +348,12 @@ if [[ -z "$HF_TOKEN" ]]; then
 fi
 
 if [[ -n "$HF_TOKEN" ]]; then
+    # Strip non-ASCII/non-token chars (e.g. Unicode ellipsis from copy-paste truncation)
+    HF_TOKEN=$(echo "$HF_TOKEN" | LC_ALL=C tr -cd 'A-Za-z0-9_-')
     export HF_TOKEN="$HF_TOKEN"
     # Persist so future setup runs and pipeline runs can find it
     grep -q "HF_TOKEN" /workspace/.env 2>/dev/null \
-        || echo "export HF_TOKEN=\"$HF_TOKEN\"" >> /workspace/.env
+        || echo "HF_TOKEN=\"$HF_TOKEN\"" >> /workspace/.env
 
     if $PYTHON -c "
 from huggingface_hub import HfApi
@@ -470,7 +472,7 @@ _patch()
 try:
     from TTS.api import TTS
     print("Downloading XTTS v2 …")
-    tts = TTS("tts_models/multilingual/multi-dataset/xtts_v2", gpu=False, verbose=False)
+    tts = TTS("tts_models/multilingual/multi-dataset/xtts_v2", gpu=False)
     del tts
     print("✓ XTTS v2 cached")
 except Exception as e:
