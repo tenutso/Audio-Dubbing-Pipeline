@@ -134,7 +134,9 @@ class PipelineConfig:
     eurollm_model: str = "utter-project/EuroLLM-9B-Instruct"
     eurollm_quantize: bool = True          # 8-bit to save VRAM (~9 GB vs ~18 GB)
     translation_model: str = "qwen3:14b"   # Ollama — review pass or primary backend
-    translation_backend: str = "eurollm"   # "eurollm" | "qwen"
+    translation_backend: str = "eurollm"   # "eurollm" | "qwen" | "gemini"
+    gemini_model: str = "gemini-2.5-flash"
+    gemini_api_key: str = ""
     translation_temperature: float = 0.3
     translation_batch_size: int = 10
     translation_review: bool = True
@@ -250,6 +252,11 @@ def load_config(path: str) -> PipelineConfig:
         huggingface_token=(
             t.get("huggingface_token", "")
             or os.environ.get("HF_TOKEN", "")
+        ),
+        gemini_model=t.get("gemini_model", "gemini-2.5-flash"),
+        gemini_api_key=(
+            t.get("gemini_api_key", "")
+            or os.environ.get("GEMINI_API_KEY", "")
         ),
         locale=t.get("locale", "fr"),
         glossary_path=t.get("glossary_path", ""),
@@ -764,6 +771,34 @@ def _ollama_call(prompt: str, model: str, temperature: float, log: logging.Logge
         return None
 
 
+def _gemini_call(
+    prompt: str,
+    model_name: str,
+    temperature: float,
+    api_key: str,
+    log: logging.Logger,
+) -> Optional[str]:
+    try:
+        import google.generativeai as genai
+    except ImportError:
+        log.error("google-generativeai not installed. Run: pip install google-generativeai")
+        return None
+    try:
+        genai.configure(api_key=api_key)
+        model = genai.GenerativeModel(model_name)
+        resp = model.generate_content(
+            prompt,
+            generation_config=genai.types.GenerationConfig(
+                temperature=temperature,
+                max_output_tokens=4096,
+            ),
+        )
+        return resp.text.strip() if resp.text else None
+    except Exception as e:
+        log.error(f"Gemini API call failed: {e}")
+        return None
+
+
 def _parse_numbered(text: str, count: int) -> List[str]:
     # Strip Qwen3 chain-of-thought blocks emitted when /no_think isn't honoured
     text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
@@ -1140,6 +1175,162 @@ def translate_segments_qwen(
             log.info(f"  Used natural fallback for {salvaged} stubborn segment(s)")
 
     log.info(f"✓ Qwen translation complete ({target_lang})")
+    return out
+
+
+def translate_segments_gemini(
+    segments: List[dict],
+    model_name: str,
+    api_key: str,
+    temperature: float,
+    batch_size: int,
+    log: logging.Logger,
+    target_lang: str = "fr",
+    cps_safety: float = 1.1,
+    natural_pass: bool = True,
+    glossary_section: str = "",
+) -> List[dict]:
+    """Translate using the Gemini API (google-generativeai SDK).
+
+    Mirrors the three-pass EuroLLM/Qwen translation logic:
+      Pass 1 — fitted batched translation with CPS character budgets
+      Pass 2 — batched overflow retry with progressively tighter budgets
+      Pass 3 — optional unconstrained natural pass for SRT readability
+    """
+    language = _LANG_NAMES.get(target_lang, target_lang.upper())
+    out = [dict(s) for s in segments]
+    log.info(f"Translating with {model_name} (Gemini API) as primary engine …")
+
+    # ── Pass 1: fitted batched translation ────────────────────────────────────
+    for start in tqdm(range(0, len(segments), batch_size), desc=f"Translating fitted ({target_lang})"):
+        batch = segments[start : start + batch_size]
+        numbered, budgets = _format_fitted_segments(batch, target_lang, cps_safety)
+        prompt = _TRANSLATE_PROMPT.format(language=language, segments=numbered, glossary_section=glossary_section)
+        response = _gemini_call(prompt, model_name, temperature, api_key, log)
+        if response:
+            translations = _parse_numbered(response, len(batch))
+            for i, seg in enumerate(batch):
+                out[start + i]["text_fr"] = translations[i] or seg["text"]
+                out[start + i]["_budget"] = budgets[i]
+        else:
+            for i, seg in enumerate(batch):
+                out[start + i]["text_fr"] = seg["text"]
+                out[start + i]["_budget"] = budgets[i]
+
+    # ── Pass 2: batched overflow retry with progressively tighter budgets ────
+    OVERFLOW_FACTOR = 1.4
+    MAX_RETRIES = 3
+
+    def _overflow(seg: dict) -> bool:
+        budget = seg.get("_budget", _budget_chars(seg, target_lang, cps_safety))
+        return len(seg.get("text_fr", "")) > budget * OVERFLOW_FACTOR
+
+    remaining = [i for i, s in enumerate(out) if _overflow(s)]
+
+    if not remaining:
+        log.info("  No segments overflow the CPS budget — skipping retry pass")
+    else:
+        log.info(f"  {len(remaining)}/{len(out)} segments overflow — batched retry with tighter budgets")
+        budgets_now = {i: out[i].get("_budget", _budget_chars(out[i], target_lang, cps_safety)) for i in remaining}
+
+        for attempt in range(1, MAX_RETRIES + 1):
+            if not remaining:
+                break
+            for i in remaining:
+                budgets_now[i] = max(20, int(budgets_now[i] * 0.7))
+
+            for start in tqdm(
+                range(0, len(remaining), batch_size),
+                desc=f"Retry pass {attempt}/{MAX_RETRIES} ({len(remaining)} segs)",
+            ):
+                batch_ids = remaining[start : start + batch_size]
+                numbered = "\n".join(
+                    f"{k + 1}. (MAX {budgets_now[i]} chars) {out[i]['text']}"
+                    for k, i in enumerate(batch_ids)
+                )
+                prompt = _TRANSLATE_PROMPT.format(language=language, segments=numbered, glossary_section=glossary_section)
+                response = _gemini_call(prompt, model_name, temperature, api_key, log)
+                if response:
+                    candidates = _parse_numbered(response, len(batch_ids))
+                    for k, i in enumerate(batch_ids):
+                        if candidates[k]:
+                            out[i]["text_fr"] = candidates[k]
+
+            remaining = [i for i in remaining if _overflow(out[i])]
+            log.info(f"  After retry pass {attempt}: {len(remaining)} segments still overflow")
+
+        if remaining:
+            log.info(f"  {len(remaining)} segments did not converge — natural-pass fallback will handle them")
+
+    # ── Pass 3: optional natural (unconstrained) translation for SRT ─────────
+    if natural_pass:
+        for start in tqdm(range(0, len(segments), batch_size), desc=f"Translating natural ({target_lang})"):
+            batch = segments[start : start + batch_size]
+            numbered = "\n".join(f"{i + 1}. {s['text']}" for i, s in enumerate(batch))
+            prompt = _TRANSLATE_NATURAL_PROMPT.format(language=language, segments=numbered, glossary_section=glossary_section)
+            response = _gemini_call(prompt, model_name, 0.0, api_key, log)
+            if response:
+                translations = _parse_numbered(response, len(batch))
+                for i, seg in enumerate(batch):
+                    out[start + i]["text_fr_natural"] = translations[i] or out[start + i].get("text_fr", seg["text"])
+            else:
+                for i in range(len(batch)):
+                    out[start + i]["text_fr_natural"] = out[start + i].get("text_fr", batch[i]["text"])
+
+        salvaged = 0
+        for seg in out:
+            budget = seg.get("_budget", _budget_chars(seg, target_lang, cps_safety))
+            if (
+                len(seg.get("text_fr", "")) > budget * OVERFLOW_FACTOR
+                and seg.get("text_fr_natural")
+                and len(seg["text_fr_natural"]) < len(seg["text_fr"])
+            ):
+                seg["text_fr"] = seg["text_fr_natural"]
+                salvaged += 1
+        if salvaged:
+            log.info(f"  Used natural fallback for {salvaged} stubborn segment(s)")
+
+    log.info(f"✓ Gemini translation complete ({target_lang})")
+    return out
+
+
+def review_translations_gemini(
+    segments: List[dict],
+    model_name: str,
+    api_key: str,
+    temperature: float,
+    log: logging.Logger,
+    batch_size: int = 50,
+    target_lang: str = "fr",
+    locale: str = "fr",
+    glossary_section: str = "",
+) -> List[dict]:
+    log.info(f"Gemini review pass — {len(segments)} segments …")
+    language = _LANG_NAMES.get(target_lang, target_lang.upper())
+    locale_note = (
+        "\nUse Québécois/Canadian French register throughout "
+        "(e.g. courriel, fin de semaine, dîner for lunch, souper for supper)."
+        if locale == "fr-ca" else ""
+    )
+    out = [dict(s) for s in segments]
+
+    for start in tqdm(range(0, len(segments), batch_size), desc=f"Reviewing ({target_lang})"):
+        batch = segments[start : start + batch_size]
+        numbered = "\n".join(f"{i + 1}. {s.get('text_fr', '')}" for i, s in enumerate(batch))
+        prompt = _REVIEW_PROMPT.format(
+            language=language,
+            segments=numbered,
+            locale_note=locale_note,
+            glossary_section=glossary_section,
+        )
+        response = _gemini_call(prompt, model_name, temperature, api_key, log)
+        if response:
+            corrected = _parse_numbered(response, len(batch))
+            for i in range(len(batch)):
+                if corrected[i]:
+                    out[start + i]["text_fr"] = corrected[i]
+
+    log.info("✓ Gemini review complete")
     return out
 
 
@@ -1738,9 +1929,23 @@ def process_video(
 
     log.info(f"\n{'=' * 60}\nPipeline v3.0: {name}\n{'=' * 60}")
 
-    # Pre-flight: Ollama needed for Qwen backend or the Qwen review pass
-    if config.translation_backend == "qwen" or config.translation_review:
+    # Pre-flight: Ollama needed for Qwen backend or the Qwen review pass.
+    # Gemini path is fully self-contained — Ollama is not required.
+    needs_ollama = (
+        config.translation_backend == "qwen"
+        or (config.translation_review and config.translation_backend != "gemini")
+    )
+    if needs_ollama:
         if not check_ollama(config.translation_model, log):
+            return False
+
+    if config.translation_backend == "gemini":
+        if not config.gemini_api_key:
+            log.error(
+                "GEMINI_API_KEY not set.\n"
+                "  Get a key at https://aistudio.google.com/app/apikey\n"
+                "  Then: export GEMINI_API_KEY=your_key  or set translation.gemini_api_key in config.yaml"
+            )
             return False
 
     # Load glossary (Canadian French vocabulary + formatting + inclusive language)
@@ -1812,6 +2017,20 @@ def process_video(
             natural_pass=config.translate_natural_pass,
             glossary_section=glossary_section,
         )
+    elif config.translation_backend == "gemini":
+        log.info(f"\n[3/7] TRANSLATING ({config.gemini_model} via Gemini API)")
+        segments = translate_segments_gemini(
+            segments,
+            config.gemini_model,
+            config.gemini_api_key,
+            config.translation_temperature,
+            config.translation_batch_size,
+            log,
+            target_lang=config.target_lang,
+            cps_safety=config.cps_safety,
+            natural_pass=config.translate_natural_pass,
+            glossary_section=glossary_section,
+        )
     else:
         log.info("\n[3/7] TRANSLATING (EuroLLM-9B)")
         segments = translate_segments(
@@ -1829,21 +2048,35 @@ def process_video(
         )
     _verify_translation_quality(segments, log)
 
-    # ── 3b. Review pass (Qwen) ────────────────────────────────────────────────
+    # ── 3b. Review pass ───────────────────────────────────────────────────────
     if config.translation_review:
-        if config.translation_backend == "qwen":
-            log.info(f"\n[3b/7] REVIEWING TRANSLATIONS ({config.translation_model} — self-review)")
+        if config.translation_backend == "gemini":
+            log.info(f"\n[3b/7] REVIEWING TRANSLATIONS ({config.gemini_model} — Gemini)")
+            segments = review_translations_gemini(
+                segments,
+                config.gemini_model,
+                config.gemini_api_key,
+                config.translation_temperature,
+                log,
+                batch_size=config.translation_batch_size,
+                target_lang=config.target_lang,
+                locale=config.locale,
+                glossary_section=glossary_section,
+            )
         else:
-            log.info(f"\n[3b/7] REVIEWING TRANSLATIONS ({config.translation_model})")
-        segments = review_translations(
-            segments,
-            config.translation_model,
-            config.translation_temperature,
-            log,
-            target_lang=config.target_lang,
-            locale=config.locale,
-            glossary_section=glossary_section,
-        )
+            if config.translation_backend == "qwen":
+                log.info(f"\n[3b/7] REVIEWING TRANSLATIONS ({config.translation_model} — self-review)")
+            else:
+                log.info(f"\n[3b/7] REVIEWING TRANSLATIONS ({config.translation_model})")
+            segments = review_translations(
+                segments,
+                config.translation_model,
+                config.translation_temperature,
+                log,
+                target_lang=config.target_lang,
+                locale=config.locale,
+                glossary_section=glossary_section,
+            )
 
     # ── 3c. Glossary post-processing (Canadian French enforcement) ─────────────
     if glossary.entries:
@@ -1962,12 +2195,13 @@ def process_video(
 @click.option("--force", is_flag=True, default=False, help="Overwrite existing outputs")
 @click.option(
     "--translator",
-    type=click.Choice(["eurollm", "qwen"], case_sensitive=False),
+    type=click.Choice(["eurollm", "qwen", "gemini"], case_sensitive=False),
     default=None,
     help=(
         "Translation backend override. "
         "'eurollm' = EuroLLM-9B-Instruct on-GPU (gated HF model, best quality). "
         "'qwen' = Qwen3:14b via Ollama (no HF token needed, good for comparison). "
+        "'gemini' = Gemini API (requires GEMINI_API_KEY, no local GPU needed). "
         "Defaults to translation.backend in config.yaml."
     ),
 )
@@ -1987,7 +2221,8 @@ def main(video: str, output_dir: str, config_path: str, force: bool, translator:
 
     Compare backends:
       --translator eurollm --output-dir /workspace/outputs/eurollm
-      --translator qwen     --output-dir /workspace/outputs/qwen
+      --translator qwen    --output-dir /workspace/outputs/qwen
+      --translator gemini  --output-dir /workspace/outputs/gemini
 
     Canadian French:
       --locale fr-ca

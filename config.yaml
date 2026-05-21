@@ -50,8 +50,9 @@ whisper:
 # ============================================================
 # Translation
 # backend: "eurollm" — EuroLLM-9B-Instruct on-GPU (gated HF model, best quality)
-# backend: "qwen"    — Qwen3:14b via Ollama (no HF token, good for comparison)
-# Override at runtime: --translator eurollm | --translator qwen
+# backend: "qwen"    — Qwen3:14b via Ollama (no HF token, runs locally)
+# backend: "gemini"  — Gemini API (no local GPU required, needs GEMINI_API_KEY)
+# Override at runtime: --translator eurollm | --translator qwen | --translator gemini
 # ============================================================
 translation:
   # Primary backend: "eurollm" or "qwen"
@@ -69,6 +70,13 @@ translation:
   # access at https://huggingface.co/utter-project/EuroLLM-9B-Instruct
   # Leave blank to read from the HF_TOKEN environment variable instead.
   huggingface_token: ""
+
+  # Gemini API — no local GPU required; set GEMINI_API_KEY env var or fill in below.
+  # Get a free key at https://aistudio.google.com/app/apikey
+  # Models: gemini-2.5-flash (fast/cheap), gemini-2.5-pro (best quality)
+  # Override at runtime: --translator gemini
+  gemini_model: gemini-2.5-flash
+  gemini_api_key: ""
 
   # Qwen3:14b via Ollama — review pass (both backends) or primary (backend: qwen)
   # Qwen3 is a clear upgrade from 2.5: better multilingual accuracy, shorter
