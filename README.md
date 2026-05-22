@@ -1,518 +1,325 @@
-# Audio Dubbing Pipeline for RunPod - Complete Setup Package
+# French Dubbing Pipeline
 
-## Overview
+Turn English webinar MP4s into French audio tracks with synchronised SRT subtitles. Designed to run end-to-end on a single RTX 4090 (24 GB) RunPod instance.
 
-This is a **complete, production-ready system** for converting English webinar MP4 files into:
-1. **French(or other) audio tracks** (natural spoken French with voice cloning)
-2. **Synchronized SRT subtitles** (French translations)
-
-Everything is **open-source, fully reproducible, and optimized for RunPod's on-demand GPU pricing**.
-
-### Key Features
-
-✅ **Natural Translation** - Uses local LLM (Ollama) for context-aware French translation  
-✅ **Voice Cloning** - Synthesized French sounds like the original English speaker  
-✅ **Batch Automation** - Process unlimited videos with zero manual intervention  
-✅ **Broadcast Quality** - 24kHz audio, 128kbps AAC, SRT subtitles ready for Vimeo  
-✅ **Cost Optimized** - ~$0.18-0.25 per 1-hour video (vs $1-3 for cloud services)  
-✅ **Reproducible** - Docker containerized, fully scripted deployment  
-
-### At a Glance
-
-| Aspect | Details |
-|--------|---------|
-| **Time per 1-hour webinar** | 25-35 minutes |
-| **Cost per video (RTX 4090)** | $0.18-0.25 |
-| **Cost per video (A5000)** | $0.23-0.30 |
-| **Monthly (20 videos)** | $3.60-6.00 |
-| **Quality** | Professional broadcast |
-| **Setup time** | 45 minutes (one-time) |
-| **Languages** | English → French (extensible to any pair) |
-| **License** | 100% open-source (MIT, Apache, MPL) |
+The pipeline does everything from source separation through TTS and subtitle alignment, and exposes both a CLI and a small **web UI** for non-technical users to submit jobs, monitor progress, and download results.
 
 ---
 
-## What You're Getting
+## What's in the box
 
-### 📄 Documentation Files
+| Stage | Component(s) | Notes |
+|---|---|---|
+| Source separation | [Demucs htdemucs](https://github.com/facebookresearch/demucs) | Splits vocals from background music so the dub can be re-mixed cleanly |
+| Transcription | [faster-whisper large-v3](https://github.com/SYSTRAN/faster-whisper) | CTranslate2, float16, word timestamps + VAD |
+| Speaker diarization | [pyannote/speaker-diarization-community-1](https://huggingface.co/pyannote/speaker-diarization-community-1) | Optional; per-speaker voice cloning when enabled |
+| Translation | **EuroLLM-9B-Instruct**, **Qwen3:14b via Ollama**, or **Gemini API** | Pick at runtime with `--translator` |
+| Translation review | Qwen3:14b (or Gemini) | Second-pass naturalness/idiom fix; CPS-budgeted |
+| TTS | **VoxCPM2**, **Coqui XTTS v2**, **edge-tts**, **Qwen3-TTS (cloud)**, **Qwen3-TTS-local**, or **Gemini-TTS** | Pick at runtime with `--tts` |
+| Speaker denoising | DeepFilterNet → noisereduce → FFmpeg `anlmdn` | Layered fallback chain for the voice-clone reference |
+| Assembly | FFmpeg `atempo` + crossfade | Length-fits French into original timing windows |
+| SRT alignment | [WhisperX](https://github.com/m-bain/whisperX) | Force-aligns French text to the dubbed audio |
+| Output | AAC 192 kbps 48 kHz stereo (+ optional full-mix with background) + UTF-8 SRT | Vimeo-ready |
 
-1. **00_START_HERE.md** ← READ THIS FIRST
-   - 5-minute quick start guide
-   - Step-by-step workflow examples
-   - Integration with Vimeo instructions
+### Localisation
 
-2. **01_SETUP_GUIDE.md**
-   - Complete installation instructions
-   - Step-by-step setup for RunPod
-   - Docker setup (optional but recommended)
-   - Troubleshooting for installation issues
-
-3. **05_QUICK_REFERENCE.md**
-   - Quick reference for common tasks
-   - Troubleshooting guide (7 common issues + solutions)
-   - Performance tuning tips
-   - Debugging commands
-   - Monitoring during processing
-
-4. **06_ARCHITECTURE.md**
-   - Deep technical documentation
-   - Component breakdown (Whisper, Ollama, TTS, FFmpeg)
-   - Data flow and storage requirements
-   - VRAM management and GPU utilization
-   - Performance benchmarks
-   - License information
-
-### 🐍 Python Scripts
-
-5. **02_pipeline.py** (1,100 lines)
-   - Main processing pipeline
-   - Single video processor
-   - Handles all 6 stages: audio extraction → transcription → translation → voice cloning → TTS → encoding
-   - Error handling and resume capability
-   - Comprehensive logging
-
-6. **03_batch_runner.py** (300 lines)
-   - Batch processor for multiple videos
-   - Parallel job management (limited by VRAM)
-   - Progress tracking and reporting
-   - Summary report generation
-   - Job status tracking with recovery
-
-7. **verify_setup.py** (300 lines)
-   - Post-setup verification script
-   - Checks all dependencies
-   - Validates GPU, VRAM, disk space
-   - Tests PyTorch and CUDA
-   - Gives GO/NO-GO decision
-
-### ⚙️ Configuration & Setup
-
-8. **config.yaml**
-   - All configurable parameters explained
-   - Performance profiles (fast/balanced/quality)
-   - Tuning tips for different scenarios
-   - Comments on each setting
-
-9. **requirements.txt**
-   - All Python dependencies with exact versions
-   - Organized by category (audio, speech, TTS, utilities)
-
-10. **04_setup.sh** (bash script)
-    - Automated installation
-    - System dependency installation
-    - Python environment setup
-    - Model downloading
-    - Ollama installation and configuration
-    - Creates workspace structure
-
-11. **Dockerfile**
-    - Reproducible Docker image
-    - All dependencies pre-installed
-    - Ready to push to Docker Hub or deploy on any GPU server
+- **Languages**: 15 target languages out of the box (CPS-budgeted), set via `translation.target_lang`. French is the default.
+- **Canadian French**: `--locale fr-ca` injects a glossary into the translation prompt, runs a deterministic post-processing substitution for "always"-mode terms, and tells the reviewer to use Québécois register. Glossary lives in [canadian_glossary.yaml](canadian_glossary.yaml).
 
 ---
 
-## Quick Start (5 Minutes)
+## TTS engines — when to use which
 
-### Step 1: Launch RunPod
-```
-1. Go to runpod.io → On-Demand
-2. Choose "PyTorch 2.8" template
-3. Select RTX 4090 or A5000
-4. 500GB storage
-5. Click CONNECT
-```
+| Engine | Where it runs | Voice cloning | API key | Best for |
+|---|---|---|---|---|
+| `voxcpm2` (default) | On-GPU, 48 kHz | Yes (3–25 s reference) | None | Highest fidelity. Default. |
+| `xtts2` | On-GPU, 24 kHz | Yes | None | Fallback if VoxCPM2 fails to load |
+| `qwen3-tts-local` | On-GPU, ~3.5 GB bf16, 24 kHz | Yes | None | Open-weights alternative (Apache 2.0, Qwen3-TTS 1.7B) |
+| `edge-tts` | Cloud (Microsoft), 24 kHz | No (fixed voice) | None | Fast preview / no-VRAM path |
+| `gemini-tts` | Cloud (Google), 24 kHz | No (preset voice) | `GEMINI_API_KEY` | Google's expressive preview voices |
+| `qwen3-tts` | Cloud (Alibaba DashScope) | No (preset voice) | `DASHSCOPE_API_KEY` | Qwen3-TTS-Flash hosted variant |
 
-### Step 2: Connect
+Cloud engines (`edge-tts`, `gemini-tts`, `qwen3-tts`) don't compete for VRAM, so they're a good escape hatch when other models are loaded.
+
+---
+
+## Translation backends
+
+| Backend | Runs | Setup | Notes |
+|---|---|---|---|
+| `eurollm` (default) | On-GPU via HF transformers | HuggingFace token + license acceptance for [EuroLLM-9B-Instruct](https://huggingface.co/utter-project/EuroLLM-9B-Instruct) | ~9 GB VRAM in 8-bit, ~18 GB in bfloat16. Best raw quality for European target languages. |
+| `qwen` | Local Ollama | `ollama pull qwen3:14b` | No HF token needed; CPU/GPU hybrid. Good for comparison runs. |
+| `gemini` | Cloud (Google) | `GEMINI_API_KEY` | No local GPU consumed. Uses the unified `google-genai` SDK; defaults to `gemini-2.5-flash`. |
+
+All three back-ends share the same three-pass logic (fitted → batched overflow retry with tightening budgets → optional unconstrained "natural" pass for SRT readability).
+
+---
+
+## Quick start on RunPod
+
+### 1. Launch a pod
+
+1. Sign in at <https://runpod.io> → **Pods → Deploy**.
+2. **GPU**: RTX 4090 (24 GB) — recommended. RTX A5000 / A6000 / H100 also work.
+3. **Template**: `runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404` (PyTorch 2.8.0 / CUDA 12.8.1 pre-installed).
+4. **Storage**: at least 100 GB container disk; persist a 50 GB+ volume at `/workspace` if you'll come back to the same pod.
+5. **Expose HTTP port** `7860` (for the web UI) — set in the pod's **HTTP Service Ports**.
+6. Hit **Deploy**, then **Connect → Web Terminal** (or grab the SSH command).
+
+### 2. Clone and install
+
 ```bash
-ssh runpod@your-ip
-```
-
-### Step 3: Download & Setup
-```bash
-# Download this package (adjust path as needed)
 cd /workspace
-curl -O https://your-storage/04_setup.sh
+git clone https://github.com/tenutso/french-dubbing.git
+cd french-dubbing
 bash 04_setup.sh
-
-# Wait 30-40 minutes (one-time, downloads models)
 ```
 
-### Step 4: Process Video
+`04_setup.sh` is idempotent and self-recovering: each step prints a `[hh:mm:ss] >>> …` header, errors are collected and shown in a final summary instead of aborting. It will:
+
+- install system packages (`ffmpeg`, `sox`, audio libs)
+- create `/workspace/{videos/input,outputs,models,scripts,logs,temp}`
+- pip-install the full stack (faster-whisper, demucs, DeepFilterNet, VoxCPM2, coqui-tts, WhisperX, EuroLLM deps, **fastapi + uvicorn for the web UI**, **edge-tts + dashscope + google-genai for cloud TTS**, **qwen-tts for local Qwen3-TTS**)
+- prompt for **HF_TOKEN** (required for EuroLLM + pyannote), and optionally **GEMINI_API_KEY** / **DASHSCOPE_API_KEY** — all persisted to `/workspace/.env`
+- install + start `ollama` and pull `qwen3:14b`
+- pre-download Whisper large-v3 + VoxCPM2 weights
+- copy `02_pipeline.py`, `03_batch_runner.py`, `verify_setup.py`, `05_web.sh`, and the `web/` package into `/workspace/scripts/`
+
+Expect 25–45 minutes the first time (most of it is model downloads — `hf_transfer` is enabled).
+
+### 3. Verify
+
 ```bash
-cp your_webinar.mp4 /workspace/videos/input/
-python /workspace/scripts/02_pipeline.py --video /workspace/videos/input/your_webinar.mp4
-# Outputs: /workspace/outputs/your_webinar_french.m4a + .srt
+python /workspace/scripts/verify_setup.py
 ```
 
-### Step 5: Download Results
+GO/NO-GO summary with all the package + GPU + token checks.
+
+### 4. Run it
+
+**Option A — Web UI** (drag-drop, no terminal needed)
+
 ```bash
-scp -r runpod@your-ip:/workspace/outputs/* ~/Downloads/
+bash /workspace/scripts/05_web.sh
 ```
 
-### Step 6: Stop Pod
-```
-Click STOP button in RunPod UI (critical - stops billing!)
+Open the RunPod-proxied URL for port 7860 (RunPod gives you something like `https://<pod-id>-7860.proxy.runpod.net`). Drop in a video, pick translator / TTS / locale / volume boost, hit submit. Live log streams in the page, downloads appear when the job finishes.
+
+**Option B — Single video on the CLI**
+
+```bash
+python /workspace/scripts/02_pipeline.py \
+    --video /workspace/videos/input/webinar.mp4 \
+    --translator gemini \
+    --tts voxcpm2 \
+    --locale fr-ca \
+    --volume-boost 15
 ```
 
-**Total time: 35 min | Total cost: $0.20**
+All CLI flags:
+
+| Flag | Choices / Type | Effect |
+|---|---|---|
+| `--video` | path (required) | Input MP4 |
+| `--output-dir` | path | Default `/workspace/outputs` |
+| `--config` | path | Default `/workspace/config.yaml` |
+| `--translator` | `eurollm` \| `qwen` \| `gemini` | Overrides `translation.backend` |
+| `--tts` | `voxcpm2` \| `xtts2` \| `edge-tts` \| `qwen3-tts` \| `qwen3-tts-local` \| `gemini-tts` | Overrides `tts.engine` |
+| `--locale` | `fr` \| `fr-ca` | Overrides `translation.locale`; `fr-ca` triggers glossary |
+| `--volume-boost` | float, % | Boost output loudness after peak-normalise; clipped at ±1.0 |
+| `--force` | flag | Re-process even if outputs exist |
+
+**Option C — Batch a folder**
+
+```bash
+cp ~/incoming/*.mp4 /workspace/videos/input/
+python /workspace/scripts/03_batch_runner.py
+```
+
+One job at a time (VRAM-safe). Reports to `/workspace/logs/batch_report.json`.
+
+### 5. Stop the pod
+
+When you're done, **Stop** the pod from the RunPod console — that's what stops billing. Resume later; everything in `/workspace` persists if you allocated a volume.
 
 ---
 
-## Architecture at a Glance
+## Web UI
 
-```
-MP4 VIDEO
-    ↓
-[FFmpeg] Extract audio → WAV
-    ↓
-[Whisper] Transcribe → English + timestamps
-    ↓
-[Ollama] Translate → French (natural)
-    ↓
-[Voice Cloning] Extract speaker characteristics
-    ↓
-[Coqui TTS / F5-TTS] Synthesize → French audio
-    ↓
-[Assembly] Combine segments → Single timeline
-    ↓
-[FFmpeg] Encode → AAC (Vimeo-ready)
-    ↓
-[pySRT] Generate → French subtitles (SRT)
-    ↓
-OUTPUT: French audio + subtitles (ready for Vimeo)
+The UI is a single FastAPI app at [web/app.py](web/app.py) with a vanilla-JS frontend in [web/static/](web/static/). Launch it with `bash 05_web.sh` (binds `0.0.0.0:7860`).
+
+**Features**
+
+- Drag-drop MP4 upload with progress bar (5 GB cap).
+- Pre-fills translator / TTS / locale / volume-boost from `config.yaml` defaults so you only override what you want.
+- Single-job FIFO queue — submit while a job is running, the next one starts automatically when VRAM frees.
+- Live log panel streams the pipeline's `[N/7] PHASE …` lines via Server-Sent Events.
+- Download buttons for `_french.m4a`, `_french.srt`, and the optional `_french_full.m4a` (background remix).
+- Crash-safe: if `uvicorn` is killed mid-job, the running job is recovered as `failed` on restart and queued jobs resume automatically.
+- Cancel sends SIGTERM to the whole process group, so ffmpeg children get reaped.
+- Footer shows live GPU, VRAM-free, disk-free, Ollama status, and which API keys are present.
+
+**Customise the port:**
+
+```bash
+DUBBING_WEB_PORT=8080 bash /workspace/scripts/05_web.sh
 ```
 
-**Processing time: 25-35 min per 1-hour webinar**
+**No auth.** Per the original design choice — the RunPod proxy URL is unguessable for outsiders, but **don't post the URL publicly**. If you need protection, terminate it behind an authenticated reverse proxy (cloudflared / nginx + Basic auth).
 
 ---
 
-## File Organization
+## Configuration
+
+Everything that isn't a runtime override lives in [config.yaml](config.yaml). The full file is heavily commented; the most useful knobs:
+
+```yaml
+diarization:
+  enabled: true
+  min_speakers: 2          # set to 1 only for known-single-speaker recordings
+  max_speakers: 10
+
+translation:
+  backend: eurollm         # or qwen, gemini
+  target_lang: fr          # fr es de it pt nl pl ru ja ko zh ar tr hi vi
+  locale: fr               # or fr-ca
+  cps_safety: 1.1          # bump toward 1.2 if dub feels too terse
+  natural_pass: true       # 2nd unconstrained pass for SRT readability
+
+tts:
+  engine: voxcpm2          # voxcpm2 | xtts2 | edge-tts | qwen3-tts | qwen3-tts-local | gemini-tts
+  cfg_value: 2.5
+  inference_timesteps: 24  # VoxCPM2 quality knob; 32 for max quality
+
+audio:
+  volume_boost_pct: 0      # default; override at runtime with --volume-boost N
+
+subtitles:
+  whisperx_alignment: true
+  sync_offset_ms: 0
+```
+
+---
+
+## Outputs
+
+For each `webinar.mp4` you'll get, in `/workspace/outputs/`:
+
+- `webinar_french.m4a` — French dub only (vocals + silence in the original gaps), AAC 192 kbps / 48 kHz stereo
+- `webinar_french.srt` — UTF-8 SRT, WhisperX-aligned to the French audio
+- `webinar_french_full.m4a` — full mix: French vocals + the original background bed at −3 dB (only when Demucs separation succeeded and `source_separation.preserve_background: true`)
+
+For Vimeo: upload `_full.m4a` as the alternate audio track and `.srt` as the French subtitle file.
+
+---
+
+## Running outside RunPod
+
+Anywhere you have an NVIDIA GPU with ≥ 24 GB VRAM and CUDA 12.x:
+
+- Use the [`Dockerfile`](Dockerfile) (PyTorch 2.8 / CUDA 12.8 base) — it mirrors what `04_setup.sh` does on the base RunPod image.
+- Or run the setup script directly on Ubuntu 24.04 with PyTorch 2.8 already installed; everything else is pip-installable.
+
+The `tts.engine: edge-tts` (or `gemini-tts`) path doesn't require any GPU at all — useful for a laptop sanity check before paying for cloud GPU time.
+
+---
+
+## Troubleshooting
+
+| Symptom | Most likely cause | Fix |
+|---|---|---|
+| `Diarization failed: 'DiarizeOutput' object has no attribute 'itertracks'` | pyannote returned a newer wrapped namedtuple shape | Already handled by the extractor in [02_pipeline.py:`diarize_audio`](02_pipeline.py); upgrade pyannote (`pip install -U pyannote.audio`) and re-run. The log now prints the actual field names so any future shape change is one-line to patch. |
+| Only `SPEAKER_00` detected on a multi-speaker recording | `min_speakers: 1` in config — pyannote collapses to 1 | Set `diarization.min_speakers: 2` (the new default). Verify HF token has accepted the model license at <https://huggingface.co/pyannote/speaker-diarization-community-1>. |
+| Ollama `Read timed out (read timeout=180)` during Qwen translation | First-batch cold load (~20 s) + ~2000-token generation on `qwen3:14b` can spill over the old 180 s ceiling | Already raised to 600 s + `keep_alive: 30m` in [_ollama_call](02_pipeline.py). Also check `ollama ps` — if the model is offloaded to CPU, free VRAM and `ollama run qwen3:14b ""` to warm it. |
+| "google-generativeai not installed" | Old SDK; we migrated to `google-genai` | `pip install -U google-genai`; or just re-run `04_setup.sh`. |
+| Output too quiet | Hard-coded 0.95 peak-normalise | Add `--volume-boost 20` (or set `audio.volume_boost_pct` in config). |
+| Coqui XTTS won't import: missing `isin_mps_friendly` / `is_torch_greater_or_equal` | Newer transformers removed these symbols | Already patched at import-time in [02_pipeline.py:`_patch_transformers_for_coqui`](02_pipeline.py). |
+| Web UI shows "missing FastAPI" / `ModuleNotFoundError` | `04_setup.sh` didn't reach the web-deps step | `pip install fastapi 'uvicorn[standard]' python-multipart`, then re-run `bash /workspace/scripts/05_web.sh`. |
+| Web UI restarts mid-job → job stuck `running` forever | Server crashed before the SSE could close | Already auto-recovered: `running` → `failed (server restarted mid-job)` on next launch, queued jobs replayed. |
+| Cancel left zombie `ffmpeg` processes | Subprocess group kill failed | The web app uses `start_new_session=True` + `os.killpg(SIGTERM)`; if you see leftovers, `pkill -f ffmpeg` and report. |
+
+For deeper guidance see `05_QUICK_REFERENCE.md`, `06_ARCHITECTURE.md`, and the comments inside `02_pipeline.py`.
+
+---
+
+## File layout
+
+```
+french-dubbing/
+├── 02_pipeline.py            # main CLI (single video)
+├── 03_batch_runner.py        # batch folder of MP4s
+├── 04_setup.sh               # one-shot installer for RunPod / Ubuntu 24.04
+├── 05_web.sh                 # uvicorn launcher (web UI)
+├── verify_setup.py           # GO/NO-GO post-install sanity check
+├── config.yaml               # all non-runtime knobs (commented)
+├── canadian_glossary.yaml    # fr-ca vocabulary + formatting rules
+├── requirements.txt          # pip deps (lower bounds; setup.sh auto-upgrades)
+├── Dockerfile                # PyTorch 2.8 / CUDA 12.8 reproducible image
+├── web/
+│   ├── app.py                # FastAPI app + queue worker + SSE
+│   ├── jobs.py               # Job dataclass + atomic jobs.json
+│   └── static/
+│       ├── index.html
+│       ├── app.js
+│       └── style.css
+└── README.md                 # this file
+```
+
+Runtime layout (created by `04_setup.sh`):
 
 ```
 /workspace/
-├── videos/input/              ← PUT YOUR MP4 FILES HERE
-├── outputs/                   ← DOWNLOAD RESULTS FROM HERE
-│   ├── webinar_french.m4a     (audio)
-│   └── webinar_french.srt     (subtitles)
-├── scripts/
-│   ├── 02_pipeline.py         (single processor)
-│   └── 03_batch_runner.py     (batch processor)
-├── models/                    (auto-populated, Whisper + TTS)
-├── logs/                      (processing logs)
-├── temp/                      (intermediate files, auto-cleaned)
-├── config.yaml                (configuration)
-└── venv/                      (Python virtual environment)
+├── videos/input/             # drop MP4s here for CLI / batch runs
+├── outputs/                  # CLI / batch outputs land here
+├── scripts/                  # installed copy of the pipeline + web/
+├── models/                   # auto-populated (Whisper, VoxCPM2, EuroLLM, …)
+├── logs/                     # per-video + batch + ollama logs
+├── temp/                     # intermediate stems (auto-cleaned)
+├── web/
+│   ├── uploads/              # web-UI uploads, per-job
+│   ├── outputs/<job_id>/     # web-UI per-job output dirs
+│   └── jobs.json             # persisted queue + history
+├── config.yaml
+└── .env                      # HF_TOKEN, GEMINI_API_KEY, DASHSCOPE_API_KEY
 ```
 
 ---
 
-## Detailed Step-by-Step Instructions
+## Costs
 
-### For Complete Beginner
+Rough numbers on RunPod (May 2026 pricing; subject to change):
 
-1. **Read**: 00_START_HERE.md (5 min)
-2. **Read**: 01_SETUP_GUIDE.md sections 1-6 (10 min)
-3. **Do**: Follow 01_SETUP_GUIDE.md Step 1-6 (45 min)
-4. **Verify**: Run `python verify_setup.py` (2 min)
-5. **Process**: Copy video → Run pipeline → Download (35 min)
+| GPU | $/hr | Time/video (1 h source) | Cost/video |
+|---|---|---|---|
+| RTX 4090 | ~$0.36 | 25–35 min | **$0.15 – $0.21** |
+| RTX A5000 | ~$0.45 | 30–40 min | **$0.23 – $0.30** |
 
-### For Experienced Users
-
-1. **Read**: 00_START_HERE.md
-2. **Do**: Run `bash 04_setup.sh` 
-3. **Tune**: Edit config.yaml as needed
-4. **Process**: Use batch_runner.py for multiple videos
-
-### For DevOps
-
-1. **Read**: 06_ARCHITECTURE.md
-2. **Build**: `docker build -t dubbing:latest .`
-3. **Run**: `docker run --gpus all -v /workspace:/workspace dubbing:latest`
-4. **Deploy**: Push to Docker Hub or cloud registry
+Add the cloud-API call cost if you use `--translator gemini` or `--tts gemini-tts` / `--tts qwen3-tts`. The free tier of Gemini and the very low DashScope per-character rate are usually negligible at this volume.
 
 ---
 
-## Common Workflows
+## License & attribution
 
-### Single Video (One-off)
-```bash
-python /workspace/scripts/02_pipeline.py --video input.mp4
-# Output: input_french.m4a + input_french.srt
-```
+- Pipeline code, web UI, glue: **MIT**
+- faster-whisper (CTranslate2): MIT
+- pyannote.audio: MIT
+- VoxCPM2 / Qwen3-TTS: Apache 2.0
+- Coqui XTTS v2 (`coqui-tts` fork): MPL 2.0
+- DeepFilterNet: MIT / Apache
+- WhisperX: BSD
+- Demucs: MIT
+- EuroLLM-9B-Instruct: Apache 2.0 (gated — license acceptance required)
+- FFmpeg: LGPL/GPL (depending on build)
 
-### Batch Processing (20+ videos)
-```bash
-# Copy all videos to /workspace/videos/input/
-for f in ~/webinars/*.mp4; do
-  cp "$f" /workspace/videos/input/
-done
-
-# Run batch processor
-python /workspace/scripts/03_batch_runner.py --workers 1
-
-# Check progress
-tail -f /workspace/logs/batch.log
-```
-
-### Upload to Vimeo
-```bash
-# After getting results, upload from UI:
-1. Settings → Audio & Tracks
-2. Add "input_french.m4a" as audio track (French)
-3. Add "input_french.srt" as subtitles (French)
-4. Test playback
-```
+No proprietary APIs are required to run the pipeline end-to-end; the Gemini / DashScope backends are opt-in.
 
 ---
 
-## Performance & Costs
+## Contributing / debugging
 
-### Processing Stages (per 1-hour video)
+- Logs per video: `/workspace/logs/<stem>.log`
+- Web UI logs: stdout of `05_web.sh`
+- Batch summary: `/workspace/logs/batch_report.json`
+- Job state across web-UI restarts: `/workspace/web/jobs.json`
 
-| Stage | Tool | Time | GPU |
-|-------|------|------|-----|
-| Audio extraction | FFmpeg | 2-3 min | No |
-| Transcription | Whisper | 3-5 min | Yes (6GB) |
-| Translation | Ollama | 5-8 min | No (CPU) |
-| Voice cloning | TTS | 1 min | Optional |
-| Synthesis | Coqui/F5-TTS | 8-15 min | Yes (8GB) ← **BOTTLENECK** |
-| Assembly | NumPy | 1-2 min | No |
-| Encoding | FFmpeg | 2-3 min | No |
-| **Total** | | **25-35 min** | |
-
-### Cost Breakdown
-
-**Per video:**
-- RTX 4090 @ $0.36/hr: **$0.18** (30 min)
-- A5000 @ $0.45/hr: **$0.23** (30 min)
-
-**Monthly (20 videos):**
-- RTX 4090: **$3.60**
-- A5000: **$4.60**
-
-**vs. alternatives:**
-- Descript Pro: $24/month + $25/video = **$524/month for 20 videos** ❌
-- Elevenlabs API: **$0.30/video** (but poor French quality)
-- Google Cloud TTS: **$0.50-1.00/video** (limited control)
-- **Our solution: $3.60/month** ✅
-
----
-
-## Technology Stack
-
-### Speech Recognition
-- **Whisper** (OpenAI, MIT license)
-- Model: large-v3 (1.5B params, 95% WER)
-- Speed: 3-5 min per hour on GPU
-
-### Translation
-- **Ollama** (local LLM inference, MIT license)
-- Model: Mistral 7B (4GB, fast) or Llama2 13B (8GB, better)
-- Speed: 5-8 min per hour (CPU-bound)
-
-### Text-to-Speech
-- **Coqui TTS** (Mozilla, MPL 2.0)
-  - Stable, good French quality
-  - ~8GB VRAM
-  - OR
-- **F5-TTS** (MIT, newer, experimental)
-  - Better voice cloning
-  - Requires source install
-
-### Audio Processing
-- **FFmpeg** (LGPL)
-- **LibROSA** (ISC, audio analysis)
-- **SoundFile** (BSD, WAV I/O)
-
-### Utilities
-- **Python 3.10+**
-- **PyTorch 2.8** (pre-installed on RunPod)
-- **NumPy, SciPy** (scientific computing)
-
-**All components are open-source. No proprietary APIs.**
-
----
-
-## Troubleshooting Quick Links
-
-| Problem | Solution |
-|---------|----------|
-| CUDA Out of Memory | See 05_QUICK_REFERENCE.md → Issue 1 |
-| Ollama won't start | See 05_QUICK_REFERENCE.md → Issue 2 |
-| Whisper download fails | See 05_QUICK_REFERENCE.md → Issue 3 |
-| Translation poor quality | Adjust config.yaml temperature setting |
-| Audio sounds robotic | Try F5-TTS engine instead of Coqui |
-| Processing hangs | Check GPU with `nvidia-smi` |
-
-Full guide: **05_QUICK_REFERENCE.md** (also includes debugging commands, monitoring, etc.)
-
----
-
-## Advanced Usage
-
-### Custom LLM Models
-```yaml
-# In config.yaml
-translation:
-  model: llama2:13b        # Better comprehension
-  model: neural-chat       # Specialized for dialogue
-  
-# Or download custom model:
-# ollama pull custom-model-name
-```
-
-### Voice Cloning with F5-TTS
-```bash
-# Install F5-TTS
-pip install f5tts
-
-# Switch engine in config.yaml
-tts:
-  engine: f5tts  # Better voice cloning than Coqui
-```
-
-### Groq API Integration (Optional)
-```yaml
-# Fast cloud-based LLM (100x faster than local)
-translation:
-  engine: groq
-  api_key: "gsk_xxxxx"
-  model: "mixtral-8x7b-32768"
-# Cost: +$0.10 per video (optional)
-```
-
-### Batch with Custom Settings
-```bash
-# Edit config.yaml for quality
-whisper:
-  model: large-v3
-
-translation:
-  model: llama2:13b
-
-# Run batch
-python /workspace/scripts/03_batch_runner.py --workers 1
-```
-
----
-
-## Reproducibility & DevOps
-
-### Docker Deployment
-```bash
-# Build image (includes all dependencies)
-docker build -t french-dubbing:latest .
-
-# Run on any GPU server
-docker run --gpus all \
-  -v /path/to/videos:/workspace/videos \
-  -v /path/to/outputs:/workspace/outputs \
-  french-dubbing:latest
-
-# Or deploy to Kubernetes, AWS ECS, etc.
-```
-
-### Version Pinning
-- PyTorch: 2.0.0 (pinned)
-- Whisper: 20231117 (pinned)
-- All Python packages: exact versions in requirements.txt
-- CUDA: 12.2.0 (pinned in Dockerfile)
-
-**Same config + same input = same output (deterministic)**
-
----
-
-## Support & Documentation
-
-### Reading Order
-1. **00_START_HERE.md** ← Start here (5 min)
-2. **01_SETUP_GUIDE.md** ← Full setup (30 min)
-3. **config.yaml** ← Tuning (read comments)
-4. **05_QUICK_REFERENCE.md** ← Troubleshooting
-5. **06_ARCHITECTURE.md** ← Deep dive (technical)
-
-### Getting Help
-
-**Installation issues:**
-- See 01_SETUP_GUIDE.md → Troubleshooting section
-- Run: `python verify_setup.py`
-
-**Runtime errors:**
-- See 05_QUICK_REFERENCE.md → Common Issues
-- Check logs: `tail -f /workspace/logs/batch.log`
-
-**Performance questions:**
-- See 06_ARCHITECTURE.md → Performance section
-- See 05_QUICK_REFERENCE.md → Advanced Configuration
-
-**Technical questions:**
-- Read 06_ARCHITECTURE.md (component explanations)
-- See config.yaml comments (parameter tuning)
-
----
-
-## License & Attribution
-
-- **Pipeline code**: MIT License (you can use commercially)
-- **Whisper**: MIT License (OpenAI)
-- **Ollama**: MIT License
-- **Coqui TTS**: Mozilla Public License 2.0
-- **FFmpeg**: LGPL 2.1
-
-**No proprietary APIs or licensing restrictions. Fully open-source.**
-
----
-
-## Next Steps
-
-### 1. Right Now
-- ✓ Read **00_START_HERE.md** (5 min)
-- ✓ Skim **01_SETUP_GUIDE.md** (10 min)
-
-### 2. Within 1 Hour
-- ✓ Launch RunPod instance
-- ✓ Run `bash 04_setup.sh` (40 min)
-- ✓ Run `python verify_setup.py`
-
-### 3. First Video
-- ✓ Copy video to `/workspace/videos/input/`
-- ✓ Run pipeline (35 min)
-- ✓ Download results
-
-### 4. Scale Up
-- ✓ Copy 20+ videos to input folder
-- ✓ Run batch processor (fully automated)
-- ✓ Process while you work on other things
-
-### 5. Integration
-- ✓ Upload French audio + subtitles to Vimeo
-- ✓ Verify sync and quality
-- ✓ Done! 🎉
-
----
-
-## Summary
-
-You have everything needed to:
-- ✅ Convert webinars to French with professional quality
-- ✅ Automate the entire process (batch 100+ videos)
-- ✅ Save 10x vs. cloud services ($3.60/month vs $50+)
-- ✅ Maintain full control (open-source, local processing)
-- ✅ Reproduce results (Docker, versioned dependencies)
-
-**Ready to start? → Open 00_START_HERE.md**
-
----
-
-## Contact & Feedback
-
-- Found a bug? Check logs in `/workspace/logs/`
-- Need optimization? Edit `/workspace/config.yaml`
-- Want to extend? Read `/workspace/scripts/02_pipeline.py` (well-commented)
-
----
-
-**Version**: 1.0  
-**Last Updated**: 2025-05-18  
-**Status**: Production-ready ✅
+Issues and PRs welcome at <https://github.com/tenutso/french-dubbing>.

@@ -218,6 +218,17 @@ else
     log_warn "qwen-tts install failed — qwen3-tts-local engine will be unavailable"
 fi
 
+# ── Step 8c-Web: FastAPI web UI dependencies ─────────────────────────────────
+log_step "Installing web UI dependencies (fastapi, uvicorn, python-multipart) …"
+
+if $PYTHON -m pip install --no-cache-dir --upgrade \
+       "fastapi>=0.110" "uvicorn[standard]>=0.27" "python-multipart>=0.0.9" \
+       2>&1 | tail -3 | tee -a "$LOGFILE"; then
+    log_success "Web UI dependencies installed"
+else
+    log_warn "Web UI dependency install failed — 05_web.sh will not run"
+fi
+
 # ── Step 8d: VoxCPM2 TTS ──────────────────────────────────────────────────────
 
 log_step "Installing VoxCPM2 (primary TTS) …"
@@ -568,7 +579,7 @@ $PYTHON -m pip install --no-cache-dir --force-reinstall "numpy>=1.26.4,<2.0.0" \
 
 log_step "Installing pipeline scripts …"
 
-for script in 02_pipeline.py 03_batch_runner.py verify_setup.py; do
+for script in 02_pipeline.py 03_batch_runner.py verify_setup.py 05_web.sh; do
     if [[ -f "$SCRIPT_DIR/$script" ]]; then
         cp "$SCRIPT_DIR/$script" /workspace/scripts/
         chmod +x "/workspace/scripts/$script"
@@ -598,6 +609,21 @@ else
     log_warn "canadian_glossary.yaml not found in $SCRIPT_DIR — Canadian French locale will skip glossary"
 fi
 
+# ── Step 17: Web UI package + runtime directories ────────────────────────────
+log_step "Installing web UI (FastAPI) …"
+
+if [[ -d "$SCRIPT_DIR/web" ]]; then
+    rm -rf /workspace/scripts/web
+    cp -r "$SCRIPT_DIR/web" /workspace/scripts/web
+    log_success "web/ → /workspace/scripts/web/"
+else
+    log_warn "web/ not found in $SCRIPT_DIR — web UI will not be available"
+fi
+
+mkdir -p /workspace/web/uploads /workspace/web/outputs \
+    && log_success "Runtime dirs at /workspace/web/{uploads,outputs}" \
+    || log_warn "Could not create /workspace/web/{uploads,outputs}"
+
 # ── Final Summary ──────────────────────────────────────────────────────────
 
 echo ""
@@ -624,6 +650,8 @@ echo "  2. Copy:    cp *.mp4 /workspace/videos/input/"
 echo "  3. Single:  python /workspace/scripts/02_pipeline.py \\"
 echo "                --video /workspace/videos/input/webinar.mp4"
 echo "  4. Batch:   python /workspace/scripts/03_batch_runner.py"
+echo "  5. Web UI:  bash /workspace/scripts/05_web.sh"
+echo "              then open the RunPod-proxied URL on port 7860"
 echo ""
 echo "Setup log: $LOGFILE"
 echo ""

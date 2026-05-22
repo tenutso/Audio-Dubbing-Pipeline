@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Dubbing Pipeline</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header>
+  <h1>Dubbing Pipeline</h1>
+  <div id="health" class="health" aria-live="polite">…</div>
+</header>
+
+<main>
+  <section id="submit-section" class="card">
+    <h2>New job</h2>
+    <form id="submit-form">
+      <label class="drop" id="drop">
+        <input type="file" id="video" name="video"
+               accept=".mp4,.mov,.mkv,.webm,video/*" required>
+        <span id="drop-text">Drop a video file here or click to choose</span>
+      </label>
+
+      <div class="grid">
+        <label>Translator
+          <select id="translator" name="translator"></select>
+        </label>
+        <label>TTS engine
+          <select id="tts" name="tts"></select>
+        </label>
+        <label>Locale
+          <select id="locale" name="locale"></select>
+        </label>
+        <label>Volume boost (%)
+          <input type="number" id="volume_boost" name="volume_boost"
+                 min="-50" max="100" step="1" value="0">
+        </label>
+        <label class="check">
+          <input type="checkbox" id="force" name="force"> Force re-process
+        </label>
+      </div>
+
+      <div class="actions">
+        <button type="submit" id="submit-btn">Submit</button>
+        <span id="upload-status" class="muted"></span>
+      </div>
+      <progress id="upload-progress" value="0" max="100" hidden></progress>
+    </form>
+  </section>
+
+  <section class="card">
+    <h2>Active &amp; queued</h2>
+    <div id="active-list" class="job-list">
+      <div class="empty">No active jobs.</div>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>History</h2>
+    <div id="history-list" class="job-list">
+      <div class="empty">No completed jobs yet.</div>
+    </div>
+  </section>
+</main>
+
+<template id="job-card-tpl">
+  <article class="job">
+    <div class="job-head">
+      <span class="filename"></span>
+      <span class="status-pill"></span>
+    </div>
+    <div class="job-meta muted"></div>
+    <div class="job-phase"></div>
+    <pre class="job-log" hidden></pre>
+    <div class="job-downloads"></div>
+    <div class="job-actions">
+      <button class="show-log" type="button">Show log</button>
+      <button class="cancel" type="button">Cancel</button>
+    </div>
+  </article>
+</template>
+
+<script src="/static/app.js" defer></script>
+</body>
+</html>

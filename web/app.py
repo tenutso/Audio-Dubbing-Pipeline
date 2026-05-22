@@ -1,0 +1,510 @@
+"""FastAPI web UI for the dubbing pipeline.
+
+Single-job FIFO queue; one background worker subprocesses 02_pipeline.py for
+each job. Live status comes from streaming the subprocess's stdout (which is
+also the pipeline's own log) over Server-Sent Events.
+"""
+from __future__ import annotations
+
+import asyncio
+import logging
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import time
+from collections import deque
+from pathlib import Path
+from typing import Dict, Optional
+
+import yaml
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import (
+    FileResponse, HTMLResponse, JSONResponse, StreamingResponse,
+)
+from fastapi.staticfiles import StaticFiles
+
+from .jobs import (
+    Job, JOBS_FILE, STATUS_CANCELLED, STATUS_COMPLETED, STATUS_FAILED,
+    STATUS_QUEUED, STATUS_RUNNING, TERMINAL,
+    load_jobs, new_job_id, safe_stem, save_jobs, sorted_jobs,
+)
+
+# ── Paths ─────────────────────────────────────────────────────────────────────
+WEB_ROOT     = Path(__file__).resolve().parent
+STATIC_DIR   = WEB_ROOT / "static"
+WORKSPACE    = Path(os.environ.get("DUBBING_WORKSPACE", "/workspace"))
+UPLOAD_DIR   = WORKSPACE / "web" / "uploads"
+OUTPUT_DIR   = WORKSPACE / "web" / "outputs"
+LOG_DIR      = WORKSPACE / "logs"
+CONFIG_PATH  = WORKSPACE / "config.yaml"
+PIPELINE_PY  = WORKSPACE / "scripts" / "02_pipeline.py"
+
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+# ── Choices (mirror Click definitions in 02_pipeline.py) ──────────────────────
+TRANSLATOR_CHOICES = ["eurollm", "qwen", "gemini"]
+TTS_CHOICES = [
+    "voxcpm2", "xtts2", "edge-tts",
+    "qwen3-tts", "qwen3-tts-local", "gemini-tts",
+]
+LOCALE_CHOICES = ["fr", "fr-ca"]
+
+MAX_UPLOAD_BYTES = 5 * 1024 * 1024 * 1024  # 5 GB
+LOG_BUFFER_LINES = 500
+
+PHASE_RE = re.compile(r"\[(\d+)/7\]\s+(.+)")
+
+log = logging.getLogger("dubbing.web")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+
+# ── App state ─────────────────────────────────────────────────────────────────
+class State:
+    def __init__(self) -> None:
+        self.jobs: Dict[str, Job] = load_jobs()
+        self.queue: asyncio.Queue[str] = asyncio.Queue()
+        # Per-job log subscribers (asyncio queues) for SSE fan-out
+        self.subscribers: Dict[str, list] = {}
+        # Per-job in-memory log ring buffer for late-joiners
+        self.log_buffers: Dict[str, deque] = {}
+        # Running process handle (only one at a time)
+        self.current_proc: Optional[asyncio.subprocess.Process] = None
+        self.current_job_id: Optional[str] = None
+        self.worker_task: Optional[asyncio.Task] = None
+
+    def save(self) -> None:
+        save_jobs(self.jobs)
+
+    def publish(self, job_id: str, line: str) -> None:
+        buf = self.log_buffers.setdefault(job_id, deque(maxlen=LOG_BUFFER_LINES))
+        buf.append(line)
+        for q in self.subscribers.get(job_id, []):
+            try:
+                q.put_nowait(line)
+            except asyncio.QueueFull:
+                pass
+
+
+state = State()
+app = FastAPI(title="Dubbing Web UI")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+
+
+# ── Queue worker ──────────────────────────────────────────────────────────────
+async def _run_job(job: Job) -> None:
+    """Execute one pipeline subprocess; stream its stdout into the job's log buffer."""
+    job.status = STATUS_RUNNING
+    job.started_at = time.time()
+    state.current_job_id = job.id
+    state.save()
+    state.publish(job.id, f">>> Starting: {job.video_filename}")
+
+    cmd = [
+        sys.executable, str(PIPELINE_PY),
+        "--video",      job.video_path,
+        "--output-dir", job.output_dir,
+        "--config",     str(CONFIG_PATH),
+    ]
+    opts = job.options or {}
+    if opts.get("force"):
+        cmd.append("--force")
+    if opts.get("translator"):
+        cmd += ["--translator", opts["translator"]]
+    if opts.get("tts"):
+        cmd += ["--tts", opts["tts"]]
+    if opts.get("locale"):
+        cmd += ["--locale", opts["locale"]]
+    if opts.get("volume_boost") not in (None, ""):
+        cmd += ["--volume-boost", str(opts["volume_boost"])]
+
+    state.publish(job.id, "$ " + " ".join(cmd))
+
+    try:
+        # start_new_session so we can kill the whole process group on cancel
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+    except Exception as e:
+        job.status = STATUS_FAILED
+        job.error = f"failed to launch pipeline: {e}"
+        job.ended_at = time.time()
+        state.publish(job.id, f"!!! launch failed: {e}")
+        state.current_job_id = None
+        state.save()
+        return
+
+    state.current_proc = proc
+
+    try:
+        assert proc.stdout is not None
+        while True:
+            line_bytes = await proc.stdout.readline()
+            if not line_bytes:
+                break
+            line = line_bytes.decode("utf-8", errors="replace").rstrip()
+            if not line:
+                continue
+            m = PHASE_RE.search(line)
+            if m:
+                job.phase = f"[{m.group(1)}/7] {m.group(2)}".strip()
+            state.publish(job.id, line)
+    except Exception as e:
+        state.publish(job.id, f"!!! log-stream error: {e}")
+
+    rc = await proc.wait()
+    job.returncode = rc
+    job.ended_at = time.time()
+
+    # Determine final status
+    if job.status == STATUS_CANCELLED:
+        pass  # cancel already set status
+    elif rc == 0:
+        job.status = STATUS_COMPLETED
+        _collect_outputs(job)
+    else:
+        job.status = STATUS_FAILED
+        job.error = job.error or f"pipeline exited with code {rc}"
+
+    state.publish(job.id, f"<<< {job.status.upper()} (rc={rc})")
+    # Signal SSE subscribers to close cleanly
+    for q in state.subscribers.get(job.id, []):
+        try:
+            q.put_nowait(None)
+        except asyncio.QueueFull:
+            pass
+
+    state.current_proc = None
+    state.current_job_id = None
+    state.save()
+
+
+def _collect_outputs(job: Job) -> None:
+    """Populate job.outputs by globbing the per-job output directory."""
+    od = Path(job.output_dir)
+    if not od.exists():
+        return
+    audio = sorted(od.glob("*_french.m4a"))
+    srt   = sorted(od.glob("*_french.srt"))
+    full  = sorted(od.glob("*_french_full.m4a"))
+    if audio:
+        job.outputs["audio"] = str(audio[0])
+    if srt:
+        job.outputs["srt"] = str(srt[0])
+    if full:
+        job.outputs["full"] = str(full[0])
+
+
+async def _queue_worker() -> None:
+    """Consume job IDs from the queue and run them one at a time."""
+    while True:
+        job_id = await state.queue.get()
+        job = state.jobs.get(job_id)
+        if not job:
+            state.queue.task_done()
+            continue
+        if job.status != STATUS_QUEUED:
+            state.queue.task_done()
+            continue
+        try:
+            await _run_job(job)
+        except Exception as e:
+            job.status = STATUS_FAILED
+            job.error = f"worker exception: {e}"
+            job.ended_at = time.time()
+            state.save()
+            log.exception("worker failed for job %s", job_id)
+        finally:
+            state.queue.task_done()
+
+
+# ── Lifecycle ────────────────────────────────────────────────────────────────
+@app.on_event("startup")
+async def _startup() -> None:
+    # Re-enqueue any queued jobs (preserved across restarts)
+    for j in sorted(state.jobs.values(), key=lambda j: j.queued_at):
+        if j.status == STATUS_QUEUED:
+            await state.queue.put(j.id)
+    state.worker_task = asyncio.create_task(_queue_worker())
+    log.info("dubbing web UI started")
+
+
+@app.on_event("shutdown")
+async def _shutdown() -> None:
+    if state.current_proc and state.current_proc.returncode is None:
+        try:
+            os.killpg(os.getpgid(state.current_proc.pid), signal.SIGTERM)
+        except Exception:
+            pass
+
+
+# ── Routes ────────────────────────────────────────────────────────────────────
+@app.get("/", response_class=HTMLResponse)
+async def index() -> HTMLResponse:
+    html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+    return HTMLResponse(content=html)
+
+
+@app.get("/api/options")
+async def options() -> JSONResponse:
+    defaults = {
+        "translator": "eurollm",
+        "tts": "voxcpm2",
+        "locale": "fr",
+        "volume_boost": 0,
+    }
+    try:
+        if CONFIG_PATH.exists():
+            with CONFIG_PATH.open(encoding="utf-8") as f:
+                cfg = yaml.safe_load(f) or {}
+            defaults["translator"] = cfg.get("translation", {}).get("backend", defaults["translator"])
+            defaults["tts"] = cfg.get("tts", {}).get("engine", defaults["tts"])
+            defaults["locale"] = cfg.get("translation", {}).get("locale", defaults["locale"])
+            defaults["volume_boost"] = cfg.get("audio", {}).get("volume_boost_pct", defaults["volume_boost"])
+    except Exception as e:
+        log.warning("failed to read config defaults: %s", e)
+    return JSONResponse({
+        "translators": TRANSLATOR_CHOICES,
+        "tts": TTS_CHOICES,
+        "locales": LOCALE_CHOICES,
+        "defaults": defaults,
+        "config_path": str(CONFIG_PATH),
+    })
+
+
+@app.post("/api/jobs")
+async def submit(
+    video: UploadFile = File(...),
+    translator: str = Form(""),
+    tts: str = Form(""),
+    locale: str = Form(""),
+    volume_boost: str = Form(""),
+    force: str = Form(""),
+) -> JSONResponse:
+    # Validate options against allow-lists (empty = use config default)
+    if translator and translator not in TRANSLATOR_CHOICES:
+        raise HTTPException(400, f"invalid translator: {translator}")
+    if tts and tts not in TTS_CHOICES:
+        raise HTTPException(400, f"invalid tts engine: {tts}")
+    if locale and locale not in LOCALE_CHOICES:
+        raise HTTPException(400, f"invalid locale: {locale}")
+    vb: Optional[float] = None
+    if volume_boost.strip():
+        try:
+            vb = float(volume_boost)
+        except ValueError:
+            raise HTTPException(400, "volume_boost must be a number")
+
+    if not video.filename:
+        raise HTTPException(400, "no file uploaded")
+
+    job_id = new_job_id()
+    stem = safe_stem(video.filename) or "video"
+    dest = UPLOAD_DIR / f"{job_id}__{stem}.mp4"
+
+    # Stream upload to disk with a hard size cap
+    written = 0
+    with dest.open("wb") as out:
+        while True:
+            chunk = await video.read(1024 * 1024)
+            if not chunk:
+                break
+            written += len(chunk)
+            if written > MAX_UPLOAD_BYTES:
+                out.close()
+                dest.unlink(missing_ok=True)
+                raise HTTPException(413, f"file exceeds {MAX_UPLOAD_BYTES // 1024**3} GB cap")
+            out.write(chunk)
+
+    output_dir = OUTPUT_DIR / job_id
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    log_path = LOG_DIR / f"{dest.stem}.log"
+
+    job = Job(
+        id=job_id,
+        video_filename=video.filename,
+        video_path=str(dest),
+        output_dir=str(output_dir),
+        log_path=str(log_path),
+        options={
+            "translator": translator or None,
+            "tts": tts or None,
+            "locale": locale or None,
+            "volume_boost": vb,
+            "force": force.lower() in ("1", "true", "on", "yes"),
+        },
+    )
+    state.jobs[job_id] = job
+    state.save()
+    await state.queue.put(job_id)
+
+    # Position in queue = number of queued jobs ahead + 1 if running, else 1
+    queued_ahead = sum(
+        1 for j in state.jobs.values()
+        if j.status == STATUS_QUEUED and j.queued_at < job.queued_at
+    )
+    position = queued_ahead + (1 if state.current_job_id else 0)
+    return JSONResponse({"id": job_id, "position": position}, status_code=201)
+
+
+@app.get("/api/jobs")
+async def list_jobs() -> JSONResponse:
+    return JSONResponse({
+        "jobs": [j.to_dict() for j in sorted_jobs(state.jobs)],
+        "current": state.current_job_id,
+    })
+
+
+@app.get("/api/jobs/{job_id}")
+async def get_job(job_id: str) -> JSONResponse:
+    job = state.jobs.get(job_id)
+    if not job:
+        raise HTTPException(404, "job not found")
+    return JSONResponse(job.to_dict())
+
+
+@app.delete("/api/jobs/{job_id}")
+async def cancel_job(job_id: str, cleanup: bool = False) -> JSONResponse:
+    job = state.jobs.get(job_id)
+    if not job:
+        raise HTTPException(404, "job not found")
+
+    if job.status == STATUS_RUNNING:
+        job.status = STATUS_CANCELLED
+        proc = state.current_proc
+        if proc and proc.returncode is None:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+            except Exception as e:
+                log.warning("kill failed: %s", e)
+        job.ended_at = time.time()
+        state.save()
+        return JSONResponse({"ok": True, "action": "terminated"})
+
+    if job.status == STATUS_QUEUED:
+        job.status = STATUS_CANCELLED
+        job.ended_at = time.time()
+        state.save()
+        return JSONResponse({"ok": True, "action": "dequeued"})
+
+    # Terminal — optionally clean files, always remove the record
+    if cleanup:
+        try:
+            if job.video_path and os.path.exists(job.video_path):
+                os.unlink(job.video_path)
+            if job.output_dir and os.path.isdir(job.output_dir):
+                shutil.rmtree(job.output_dir, ignore_errors=True)
+        except Exception as e:
+            log.warning("cleanup failed for %s: %s", job_id, e)
+    state.jobs.pop(job_id, None)
+    state.subscribers.pop(job_id, None)
+    state.log_buffers.pop(job_id, None)
+    state.save()
+    return JSONResponse({"ok": True, "action": "removed"})
+
+
+@app.get("/api/jobs/{job_id}/logs")
+async def job_logs(job_id: str, request: Request) -> StreamingResponse:
+    job = state.jobs.get(job_id)
+    if not job:
+        raise HTTPException(404, "job not found")
+
+    q: asyncio.Queue = asyncio.Queue(maxsize=2000)
+    state.subscribers.setdefault(job_id, []).append(q)
+
+    async def _stream():
+        # Replay buffer first (for clients that join after the job started)
+        for line in list(state.log_buffers.get(job_id, [])):
+            yield f"data: {line}\n\n"
+        # Live tail
+        try:
+            while True:
+                if await request.is_disconnected():
+                    break
+                try:
+                    item = await asyncio.wait_for(q.get(), timeout=15.0)
+                except asyncio.TimeoutError:
+                    # Keepalive comment — keeps the proxy from idle-timing out
+                    yield ": keepalive\n\n"
+                    continue
+                if item is None:
+                    # Job finished — flush a final status line then close
+                    yield f"event: done\ndata: {job.status}\n\n"
+                    break
+                yield f"data: {item}\n\n"
+        finally:
+            subs = state.subscribers.get(job_id, [])
+            if q in subs:
+                subs.remove(q)
+
+    return StreamingResponse(_stream(), media_type="text/event-stream")
+
+
+def _download(job: Job, kind: str) -> FileResponse:
+    path = job.outputs.get(kind)
+    if not path or not os.path.exists(path):
+        raise HTTPException(404, f"no {kind} output for this job")
+    stem = safe_stem(job.video_filename) or "dub"
+    ext = Path(path).suffix
+    base = {"audio": "_french", "srt": "_french", "full": "_french_full"}[kind]
+    download_name = f"{stem}{base}{ext}"
+    return FileResponse(path, filename=download_name)
+
+
+@app.get("/api/jobs/{job_id}/download/{kind}")
+async def download(job_id: str, kind: str) -> FileResponse:
+    if kind not in ("audio", "srt", "full"):
+        raise HTTPException(400, "kind must be audio|srt|full")
+    job = state.jobs.get(job_id)
+    if not job:
+        raise HTTPException(404, "job not found")
+    return _download(job, kind)
+
+
+@app.get("/api/health")
+async def health() -> JSONResponse:
+    info: dict = {
+        "pipeline_present": PIPELINE_PY.exists(),
+        "config_present": CONFIG_PATH.exists(),
+        "hf_token_present": bool(os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")),
+        "gemini_key_present": bool(os.environ.get("GEMINI_API_KEY")),
+        "dashscope_key_present": bool(os.environ.get("DASHSCOPE_API_KEY")),
+    }
+    # Disk free
+    try:
+        usage = shutil.disk_usage(str(WORKSPACE))
+        info["disk_free_gb"] = round(usage.free / 1e9, 1)
+    except Exception:
+        info["disk_free_gb"] = None
+    # GPU / VRAM via nvidia-smi
+    try:
+        r = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name,memory.total,memory.free",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if r.returncode == 0 and r.stdout.strip():
+            name, total, free = [x.strip() for x in r.stdout.splitlines()[0].split(",")]
+            info["gpu"] = name
+            info["vram_total_gb"] = round(int(total) / 1024, 1)
+            info["vram_free_gb"]  = round(int(free)  / 1024, 1)
+    except Exception:
+        pass
+    # Ollama reachable?
+    try:
+        import urllib.request
+        urllib.request.urlopen("http://localhost:11434/api/tags", timeout=2)
+        info["ollama_up"] = True
+    except Exception:
+        info["ollama_up"] = False
+    return JSONResponse(info)

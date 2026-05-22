@@ -78,6 +78,12 @@ dashscope>=1.20.0
 # qwen-tts: official local Qwen3-TTS 1.7B Python wrapper (Apache 2.0, no API key).
 qwen-tts
 
+# ── Web UI (FastAPI + uvicorn) ────────────────────────────────────────────────
+# Launcher: bash 05_web.sh  → uvicorn web.app:app on 0.0.0.0:7860
+fastapi>=0.110
+uvicorn[standard]>=0.27
+python-multipart>=0.0.9
+
 # ── Utilities ─────────────────────────────────────────────────────────────────
 # python-dotenv loads .env from project root so HF_TOKEN works without `source`.
 python-dotenv>=1.0.0
