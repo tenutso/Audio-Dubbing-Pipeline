@@ -75,6 +75,8 @@ hf_transfer>=0.1.6
 google-genai>=0.3.0
 edge-tts>=6.1.0
 dashscope>=1.20.0
+# qwen-tts: official local Qwen3-TTS 1.7B Python wrapper (Apache 2.0, no API key).
+qwen-tts
 
 # ── Utilities ─────────────────────────────────────────────────────────────────
 # python-dotenv loads .env from project root so HF_TOKEN works without `source`.

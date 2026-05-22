@@ -208,6 +208,16 @@ else
     log_warn "One or more cloud SDK installs failed — affected backends will be unavailable"
 fi
 
+# ── Step 8c-Qwen: Local Qwen3-TTS 1.7B (Apache 2.0, no API key) ───────────────
+log_step "Installing qwen-tts (local Qwen3-TTS 1.7B) …"
+
+if $PYTHON -m pip install --no-cache-dir --upgrade qwen-tts \
+       2>&1 | tail -3 | tee -a "$LOGFILE"; then
+    log_success "qwen-tts installed"
+else
+    log_warn "qwen-tts install failed — qwen3-tts-local engine will be unavailable"
+fi
+
 # ── Step 8d: VoxCPM2 TTS ──────────────────────────────────────────────────────
 
 log_step "Installing VoxCPM2 (primary TTS) …"
@@ -535,7 +545,7 @@ log_step "Upgrading non-pinned packages to latest …"
 
 $PYTHON -m pip install --upgrade --no-cache-dir \
        faster-whisper transformers accelerate bitsandbytes voxcpm whisperx \
-       google-genai edge-tts dashscope deepfilternet noisereduce \
+       google-genai edge-tts dashscope qwen-tts deepfilternet noisereduce \
        2>&1 | tail -5 | tee -a "$LOGFILE" \
     && log_success "Packages upgraded" \
     || log_warn "Upgrade pass had non-fatal issues — pipeline still usable"

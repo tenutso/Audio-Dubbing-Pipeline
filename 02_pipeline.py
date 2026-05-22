@@ -209,6 +209,7 @@ class PipelineConfig:
     edge_tts_voice_ca: str = "fr-CA-SylvieNeural"
     qwen_tts_model: str = "qwen3-tts-flash"
     qwen_tts_voice: str = "Cherry"
+    qwen_tts_local_model: str = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
     dashscope_api_key: str = ""
     gemini_tts_model: str = "gemini-2.5-flash-preview-tts"
     gemini_tts_voice: str = "Kore"
@@ -314,6 +315,9 @@ def load_config(path: str) -> PipelineConfig:
         edge_tts_voice_ca=tts.get("edge_tts_voice_ca", "fr-CA-SylvieNeural"),
         qwen_tts_model=tts.get("qwen_tts_model", "qwen3-tts-flash"),
         qwen_tts_voice=tts.get("qwen_tts_voice", "Cherry"),
+        qwen_tts_local_model=tts.get(
+            "qwen_tts_local_model", "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
+        ),
         dashscope_api_key=(
             tts.get("dashscope_api_key", "")
             or os.environ.get("DASHSCOPE_API_KEY", "")
@@ -751,9 +755,30 @@ def diarize_audio(
             log.info(f"  Pyannote params: {diarize_kwargs}")
             result = pipeline(wav_path, **diarize_kwargs)
 
-        # pyannote ≥ 3.3 wraps the output in a DiarizeOutput namedtuple;
-        # older versions return an Annotation directly
-        annotation = getattr(result, "annotation", result)
+        # Recent pyannote (≥ 3.3) wraps the output in a DiarizeOutput
+        # namedtuple whose annotation field has been renamed across versions
+        # (speaker_diarization, diarization, annotation, …). Older versions
+        # return the Annotation directly. Probe known shapes and fall back to
+        # the first field of any namedtuple.
+        annotation = result
+        if not hasattr(annotation, "itertracks"):
+            candidate = None
+            for attr in ("speaker_diarization", "diarization", "annotation"):
+                inner = getattr(result, attr, None)
+                if inner is not None and hasattr(inner, "itertracks"):
+                    candidate = inner
+                    break
+            if candidate is None and hasattr(result, "_fields") and result._fields:
+                first = getattr(result, result._fields[0])
+                if hasattr(first, "itertracks"):
+                    candidate = first
+            if candidate is None:
+                fields = getattr(result, "_fields", None) or dir(result)
+                raise RuntimeError(
+                    f"unrecognised pyannote output: type={type(result).__name__}, "
+                    f"fields={list(fields)[:10]}"
+                )
+            annotation = candidate
 
         turns = [
             (turn.start, turn.end, speaker)
@@ -1023,6 +1048,9 @@ def _verify_translation_quality(segments: List[dict], log: logging.Logger) -> No
 
 
 def _ollama_call(prompt: str, model: str, temperature: float, log: logging.Logger) -> Optional[str]:
+    # 600s read timeout covers cold model load (~20s for qwen3:14b on a 4090)
+    # plus up to ~2000 tokens of output at ~30 tok/s. keep_alive=30m pins the
+    # model in VRAM between batches so subsequent calls don't pay reload cost.
     try:
         r = requests.post(
             "http://localhost:11434/api/generate",
@@ -1030,9 +1058,10 @@ def _ollama_call(prompt: str, model: str, temperature: float, log: logging.Logge
                 "model": model,
                 "prompt": prompt,
                 "stream": False,
+                "keep_alive": "30m",
                 "options": {"temperature": temperature, "num_predict": 4096},
             },
-            timeout=180,
+            timeout=(15, 600),  # (connect, read) seconds
         )
         if r.status_code == 200:
             return r.json().get("response", "").strip()
@@ -1040,6 +1069,13 @@ def _ollama_call(prompt: str, model: str, temperature: float, log: logging.Logge
         return None
     except requests.exceptions.ConnectionError:
         log.error("Cannot reach Ollama at localhost:11434.")
+        return None
+    except requests.exceptions.ReadTimeout:
+        log.error(
+            "Ollama call timed out after 600s. The model may be stuck or VRAM "
+            "is starved. Check `nvidia-smi` and `ollama ps`; if the model isn't "
+            "loaded, free VRAM and re-run."
+        )
         return None
     except Exception as e:
         log.error(f"Ollama call failed: {e}")
@@ -1889,6 +1925,86 @@ def _tts_edge(segments, voice, log, temp_dir):
     return synthesized, sr
 
 
+_QWEN_LANG_MAP = {
+    "fr": "French", "fr-ca": "French", "en": "English", "es": "Spanish",
+    "de": "German", "it": "Italian", "pt": "Portuguese", "ru": "Russian",
+    "ja": "Japanese", "ko": "Korean", "zh": "Chinese",
+}
+
+
+def _tts_qwen3_local(
+    segments, speaker_wav, reference_transcript, model_id, locale, log,
+    speaker_profiles=None,
+):
+    """Local Qwen3-TTS 1.7B (Apache 2.0, no API key). Voice cloning from the
+    speaker reference; falls back to logging a warning if no reference is
+    available (the base model requires one). Returns 24 kHz mono."""
+    try:
+        from qwen_tts import Qwen3TTSModel
+    except ImportError:
+        log.error("qwen-tts not installed. Install: pip install qwen-tts")
+        return [], 24000
+
+    def _pick_wav(seg: dict) -> Optional[str]:
+        if speaker_profiles:
+            profile = speaker_profiles.get(seg.get("speaker", "SPEAKER_00"))
+            if profile and os.path.exists(profile):
+                return profile
+        return speaker_wav
+
+    language = _QWEN_LANG_MAP.get((locale or "fr").lower(), "French")
+    log.info(f"Loading Qwen3-TTS local: {model_id} (language={language}) …")
+    try:
+        kwargs: dict = {"device_map": "cuda:0", "dtype": torch.bfloat16}
+        try:
+            model = Qwen3TTSModel.from_pretrained(
+                model_id, attn_implementation="flash_attention_2", **kwargs
+            )
+        except Exception:
+            # flash-attn unavailable on some setups; fall back to default attention.
+            model = Qwen3TTSModel.from_pretrained(model_id, **kwargs)
+    except Exception as e:
+        log.error(f"Qwen3-TTS local load failed: {e}")
+        return [], 24000
+
+    synthesized: List[Tuple[np.ndarray, float, float]] = []
+    ref_text = (reference_transcript or "").strip()
+    sr_out = 24000
+
+    with tqdm(total=len(segments), desc="Synthesizing (qwen3-tts-local)") as pbar:
+        for seg in segments:
+            text = _seg_text(seg)
+            if not text:
+                pbar.update(1)
+                continue
+            try:
+                ref_wav = _pick_wav(seg)
+                if not (ref_wav and os.path.exists(ref_wav)):
+                    log.warning(
+                        f"Segment {seg['id']}: no speaker reference for "
+                        "qwen3-tts-local — skipping"
+                    )
+                    pbar.update(1)
+                    continue
+                wavs, model_sr = model.generate_voice_clone(
+                    text=text,
+                    language=language,
+                    ref_audio=ref_wav,
+                    ref_text=ref_text,
+                )
+                wav = np.asarray(wavs[0], dtype=np.float32)
+                if model_sr and model_sr != sr_out:
+                    wav = librosa.resample(wav, orig_sr=model_sr, target_sr=sr_out)
+                synthesized.append((wav, seg["start"], seg["end"]))
+            except Exception as e:
+                log.warning(f"Segment {seg['id']} qwen3-tts-local failed: {e}")
+            pbar.update(1)
+
+    del model
+    free_vram(log)
+    return synthesized, sr_out
+
+
 def _tts_qwen3(segments, model_name, voice, api_key, log):
     """Qwen3-TTS via Alibaba DashScope API. Returns 24 kHz mono."""
     try:
@@ -2005,6 +2121,12 @@ def synthesize_all_segments(
             "voice; per-speaker voicing is disabled."
         )
 
+    if engine == "qwen3-tts-local":
+        return _tts_qwen3_local(
+            segments, speaker_wav, reference_transcript,
+            config.qwen_tts_local_model, config.locale, log,
+            speaker_profiles=speaker_profiles,
+        )
     if engine == "voxcpm2":
         return _tts_voxcpm2(
             segments, speaker_wav, reference_transcript, config.tts_model, log,
@@ -2782,7 +2904,7 @@ def process_video(
 @click.option(
     "--tts",
     type=click.Choice(
-        ["voxcpm2", "xtts2", "edge-tts", "qwen3-tts", "gemini-tts"],
+        ["voxcpm2", "xtts2", "edge-tts", "qwen3-tts", "qwen3-tts-local", "gemini-tts"],
         case_sensitive=False,
     ),
     default=None,
@@ -2792,6 +2914,7 @@ def process_video(
         "'xtts2' = on-GPU Coqui XTTS v2 fallback. "
         "'edge-tts' = Microsoft Edge cloud, free, fixed voice. "
         "'qwen3-tts' = Alibaba DashScope API (needs DASHSCOPE_API_KEY). "
+        "'qwen3-tts-local' = official Qwen3-TTS 1.7B on-GPU, voice cloning, no key. "
         "'gemini-tts' = Google Gemini-TTS preview (needs GEMINI_API_KEY). "
         "Defaults to tts.engine in config.yaml."
     ),
@@ -2824,10 +2947,11 @@ def main(
       --translator gemini  --output-dir /workspace/outputs/gemini
 
     Pick a TTS engine:
-      --tts voxcpm2     # on-GPU 48 kHz, clones speaker voice (default)
-      --tts edge-tts    # free Microsoft cloud, no key required
-      --tts gemini-tts  # Google Gemini-TTS (GEMINI_API_KEY)
-      --tts qwen3-tts   # Alibaba DashScope (DASHSCOPE_API_KEY)
+      --tts voxcpm2          # on-GPU 48 kHz, clones speaker voice (default)
+      --tts qwen3-tts-local  # official Qwen3-TTS 1.7B on-GPU, voice cloning, no key
+      --tts edge-tts         # free Microsoft cloud, no key required
+      --tts gemini-tts       # Google Gemini-TTS (GEMINI_API_KEY)
+      --tts qwen3-tts        # Alibaba DashScope Flash (DASHSCOPE_API_KEY)
 
     Canadian French:
       --locale fr-ca

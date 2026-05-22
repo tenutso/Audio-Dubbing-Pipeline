@@ -140,12 +140,13 @@ translation:
 
 # ============================================================
 # Text-to-Speech — engine selection
-# voxcpm2   → on-GPU 48 kHz, voice cloning (default, best quality)
-# xtts2     → on-GPU Coqui XTTS v2, voice cloning, 24 kHz
-# edge-tts  → Microsoft Edge cloud, free, fixed voice, no GPU
-# qwen3-tts → Alibaba DashScope API (DASHSCOPE_API_KEY)
-# gemini-tts→ Google Gemini-TTS preview (GEMINI_API_KEY)
-# Override at runtime: --tts voxcpm2 | edge-tts | qwen3-tts | gemini-tts
+# voxcpm2         → on-GPU 48 kHz, voice cloning (default, best quality)
+# xtts2           → on-GPU Coqui XTTS v2, voice cloning, 24 kHz
+# qwen3-tts-local → official Qwen3-TTS 1.7B on-GPU, voice cloning, Apache 2.0, no key
+# edge-tts        → Microsoft Edge cloud, free, fixed voice, no GPU
+# qwen3-tts       → Alibaba DashScope API Flash variant (DASHSCOPE_API_KEY)
+# gemini-tts      → Google Gemini-TTS preview (GEMINI_API_KEY)
+# Override at runtime: --tts voxcpm2 | qwen3-tts-local | edge-tts | qwen3-tts | gemini-tts
 # Cloud engines (edge/qwen3/gemini) ignore speaker_profile_* and
 # diarization-driven per-speaker voicing — they use a fixed configured voice.
 # ============================================================
@@ -163,6 +164,10 @@ tts:
   qwen_tts_model: qwen3-tts-flash
   qwen_tts_voice: Cherry
   dashscope_api_key: ""
+
+  # Local Qwen3-TTS (1.7B, Apache 2.0, ungated). Voice-clones from the same
+  # speaker reference VoxCPM2 uses; 24 kHz output. Requires: pip install qwen-tts
+  qwen_tts_local_model: Qwen/Qwen3-TTS-12Hz-1.7B-Base
 
   # Gemini-TTS preview. Uses translation.gemini_api_key (or GEMINI_API_KEY env).
   # Voices: Kore, Puck, Charon, Fenrir, Aoede, … (see Gemini docs)
