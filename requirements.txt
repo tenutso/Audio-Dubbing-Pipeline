@@ -19,14 +19,16 @@ pydub>=0.25.1
 demucs>=4.0.0
 
 # ── Transcription — faster-whisper (CTranslate2) ──────────────────────────────
-faster-whisper>=1.0.0
+faster-whisper>=1.1.0
 
 # ── Translation — EuroLLM via HuggingFace transformers ────────────────────────
 # EuroLLM-9B-Instruct is downloaded automatically on first run (~18 GB).
 # bitsandbytes enables 8-bit quantization (~9 GB VRAM instead of ~18 GB).
-transformers>=4.40.2
-bitsandbytes>=0.41.0
-accelerate>=0.27.0
+# Lower bounds only — 04_setup.sh runs `pip install --upgrade` so the newest
+# compatible release wins. Avoid upper pins unless coqui-tts breaks.
+transformers>=4.45.0
+bitsandbytes>=0.43.0
+accelerate>=0.30.0
 
 # ── Speaker Denoising (in priority order — first available is used) ────────────
 # DeepFilterNet: best quality (neural, 48 kHz). Install without version pin;
@@ -65,6 +67,14 @@ requests>=2.32.0
 # Rust-based transfer client — multi-connection, multi-GB/s. Activated by the
 # HF_HUB_ENABLE_HF_TRANSFER=1 env var that 02_pipeline.py sets at import time.
 hf_transfer>=0.1.6
+
+# ── Cloud TTS / translation SDKs ──────────────────────────────────────────────
+# google-genai: unified Google SDK for Gemini translation AND Gemini-TTS
+# edge-tts:     Microsoft Edge free cloud TTS (no API key required)
+# dashscope:    Alibaba Cloud SDK for Qwen3-TTS (DASHSCOPE_API_KEY)
+google-genai>=0.3.0
+edge-tts>=6.1.0
+dashscope>=1.20.0
 
 # ── Utilities ─────────────────────────────────────────────────────────────────
 # python-dotenv loads .env from project root so HF_TOKEN works without `source`.

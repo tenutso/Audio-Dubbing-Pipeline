@@ -3,7 +3,13 @@
     "allow": [
       "Bash(wsl python3 *)",
       "Read(//home/anijmeh/projects/dubbing/**)",
-      "Read(///wsl.localhost/Ubuntu/home/anijmeh/projects/dubbing/**)"
+      "Read(///wsl.localhost/Ubuntu/home/anijmeh/projects/dubbing/**)",
+      "Bash(ls -la \"//wsl.localhost/Ubuntu/home/anijmeh/projects/dubbing/\" 2>&1 | head -50)",
+      "Read(///wsl.localhost/Ubuntu/home/anijmeh/projects/**)",
+      "Bash(python3 -c \"import ast, sys; ast.parse\\(open\\('/mnt/c/Users/anijmeh/AppData/Local/Temp/pipecheck.py'\\).read\\(\\)\\)\")",
+      "Bash(python3 -c \"import ast; ast.parse\\(open\\('//wsl.localhost/Ubuntu/home/anijmeh/projects/dubbing/02_pipeline.py'\\).read\\(\\)\\); print\\('parse OK'\\)\")",
+      "Bash(wsl bash *)",
+      "Bash(wsl -- bash -n /home/anijmeh/projects/dubbing/04_setup.sh)"
     ],
     "additionalDirectories": [
       "\\home\\anijmeh\\projects\\dubbing",

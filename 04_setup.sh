@@ -187,11 +187,25 @@ fi
 log_step "Installing EuroLLM dependencies (bitsandbytes, accelerate) …"
 
 if $PYTHON -m pip install --no-cache-dir \
-       "bitsandbytes>=0.41.0" "accelerate>=0.27.0" \
+       "bitsandbytes>=0.43.0" "accelerate>=0.30.0" \
        2>&1 | tail -3 | tee -a "$LOGFILE"; then
     log_success "bitsandbytes + accelerate installed"
 else
     log_warn "bitsandbytes/accelerate install failed — EuroLLM will run bfloat16 (~18 GB VRAM)"
+fi
+
+# ── Step 8c-API: Cloud TTS / translation SDKs ─────────────────────────────────
+# edge-tts:    Microsoft Edge free TTS (no key)
+# dashscope:   Alibaba Cloud SDK for Qwen3-TTS
+# google-genai: Unified Google SDK for Gemini translation AND Gemini-TTS
+log_step "Installing cloud TTS / API SDKs (edge-tts, dashscope, google-genai) …"
+
+if $PYTHON -m pip install --no-cache-dir --upgrade \
+       edge-tts dashscope google-genai \
+       2>&1 | tail -3 | tee -a "$LOGFILE"; then
+    log_success "Cloud TTS / API SDKs installed"
+else
+    log_warn "One or more cloud SDK installs failed — affected backends will be unavailable"
 fi
 
 # ── Step 8d: VoxCPM2 TTS ──────────────────────────────────────────────────────
@@ -372,6 +386,34 @@ else
     log_warn "No HuggingFace token provided — set HF_TOKEN env var before first pipeline run"
 fi
 
+# ── Optional API keys for cloud backends (Gemini, DashScope) ──────────────────
+prompt_optional_key() {
+    local var="$1" service="$2" url="$3"
+    local current="${!var:-}"
+    if [[ -n "$current" ]]; then
+        log_success "$var already set — skipping prompt"
+        return
+    fi
+    echo ""
+    echo -e "${YELLOW}${service} (optional).${NC}  Get a key at:  $url"
+    read -rp "  Enter $var (or press Enter to skip): " value
+    echo ""
+    value=$(echo "$value" | LC_ALL=C tr -cd 'A-Za-z0-9_.-')
+    if [[ -n "$value" ]]; then
+        export "$var=$value"
+        grep -q "^$var=" /workspace/.env 2>/dev/null \
+            || echo "$var=\"$value\"" >> /workspace/.env
+        log_success "$var saved to /workspace/.env"
+    else
+        log_warn "No $var provided — $service backends will prompt at first run"
+    fi
+}
+
+prompt_optional_key GEMINI_API_KEY   "Gemini (translation + Gemini-TTS)" \
+    "https://aistudio.google.com/app/apikey"
+prompt_optional_key DASHSCOPE_API_KEY "DashScope (Qwen3-TTS)" \
+    "https://dashscope.console.aliyun.com/apiKey"
+
 # ── Step 13: Pre-download Whisper large-v3 ────────────────────────────────
 
 log_step "Pre-downloading Whisper large-v3 (~3 GB) …"
@@ -482,6 +524,24 @@ PYEOF
     log_success "XTTS v2 cached"
 else
     log_warn "XTTS v2 download failed — it will auto-download on first use"
+fi
+
+# ── Step 14c: Upgrade non-pinned packages to latest ───────────────────────────
+# Pulls newest releases of everything that doesn't have an upper bound. Run
+# AFTER all installs (so transitive deps settle) and BEFORE the numpy pin (so
+# the pin still wins). Refreshes Ollama tag too.
+
+log_step "Upgrading non-pinned packages to latest …"
+
+$PYTHON -m pip install --upgrade --no-cache-dir \
+       faster-whisper transformers accelerate bitsandbytes voxcpm whisperx \
+       google-genai edge-tts dashscope deepfilternet noisereduce \
+       2>&1 | tail -5 | tee -a "$LOGFILE" \
+    && log_success "Packages upgraded" \
+    || log_warn "Upgrade pass had non-fatal issues — pipeline still usable"
+
+if curl -s http://localhost:11434/api/tags > /dev/null 2>&1; then
+    ollama pull qwen3:14b 2>&1 | tail -3 | tee -a "$LOGFILE" || true
 fi
 
 # ── Step 15: Pin numpy (must run LAST — coqui-tts dep chain upgrades it) ──

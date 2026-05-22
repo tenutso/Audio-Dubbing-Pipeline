@@ -19,6 +19,9 @@ audio:
   synthesis_sample_rate: 48000
   # Vimeo accepts both 44100 and 48000 Hz; 48000 avoids resampling loss
   output_sample_rate: 48000
+  # Boost the final output by this percent (0 = off, 20 = +20%). Applied after
+  # peak normalization; hard-clipped at ±1.0. Override at runtime: --volume-boost 20
+  volume_boost_pct: 0
 
 # ============================================================
 # Speaker Diarization — pyannote.audio (optional)
@@ -30,11 +33,13 @@ audio:
 #   https://huggingface.co/pyannote/speaker-diarization-3.1
 # ============================================================
 diarization:
-  enabled: false
-  model: pyannote/speaker-diarization-3.1
+  enabled: true
+  model: pyannote/speaker-diarization-community-1
   # Hint the expected speaker range — improves diarization accuracy.
   # Set both to the same number to force an exact speaker count.
-  min_speakers: 1
+  # min_speakers=2 keeps pyannote from collapsing to one speaker on long-form
+  # webinars; set to 1 only when you know the recording is single-speaker.
+  min_speakers: 2
   max_speakers: 10
   # Seconds of each speaker's audio to assemble for their voice clone.
   # Drawn from their longest utterances, not a fixed time window.
@@ -134,15 +139,35 @@ translation:
   natural_pass: true
 
 # ============================================================
-# Text-to-Speech — VoxCPM2
-# 2B diffusion autoregressive model, 48 kHz output, 30 languages.
-# Ultimate Cloning mode uses both reference audio AND its transcript
-# for maximum voice fidelity (transcript comes from Whisper for free).
-# Falls back to Coqui XTTS v2 if voxcpm is not installed.
+# Text-to-Speech — engine selection
+# voxcpm2   → on-GPU 48 kHz, voice cloning (default, best quality)
+# xtts2     → on-GPU Coqui XTTS v2, voice cloning, 24 kHz
+# edge-tts  → Microsoft Edge cloud, free, fixed voice, no GPU
+# qwen3-tts → Alibaba DashScope API (DASHSCOPE_API_KEY)
+# gemini-tts→ Google Gemini-TTS preview (GEMINI_API_KEY)
+# Override at runtime: --tts voxcpm2 | edge-tts | qwen3-tts | gemini-tts
+# Cloud engines (edge/qwen3/gemini) ignore speaker_profile_* and
+# diarization-driven per-speaker voicing — they use a fixed configured voice.
 # ============================================================
 tts:
+  engine: voxcpm2
   model: openbmb/VoxCPM2
   language: fr
+
+  # edge-tts voices — full list: edge-tts --list-voices | grep fr-
+  edge_tts_voice:    fr-FR-DeniseNeural
+  edge_tts_voice_ca: fr-CA-SylvieNeural   # auto-selected when locale: fr-ca
+
+  # Qwen3-TTS via DashScope. Set DASHSCOPE_API_KEY or fill dashscope_api_key below.
+  # Voices: Cherry, Ethan, Serena, Chelsie, … (see DashScope docs)
+  qwen_tts_model: qwen3-tts-flash
+  qwen_tts_voice: Cherry
+  dashscope_api_key: ""
+
+  # Gemini-TTS preview. Uses translation.gemini_api_key (or GEMINI_API_KEY env).
+  # Voices: Kore, Puck, Charon, Fenrir, Aoede, … (see Gemini docs)
+  gemini_tts_model: gemini-2.5-flash-preview-tts
+  gemini_tts_voice: Kore
 
   # Speaker reference clip for voice cloning
   # 25 s gives VoxCPM2 substantially more voice data than 15 s

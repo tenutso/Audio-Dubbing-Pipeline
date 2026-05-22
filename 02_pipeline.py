@@ -47,6 +47,40 @@ def _load_dotenv() -> None:
 
 _load_dotenv()
 
+
+def _prompt_and_persist_key(env_var: str, service: str, signup_url: str) -> str:
+    """Return an API key for `env_var`, prompting interactively when missing.
+
+    Looks up the env var first, then prompts on a TTY, then persists the answer
+    to /workspace/.env (or project-root .env) so subsequent runs are silent.
+    Returns "" when no key is available (non-TTY context with empty env).
+    """
+    existing = os.environ.get(env_var, "").strip()
+    if existing:
+        return existing
+    if not sys.stdin.isatty():
+        return ""
+    print(f"\n{service} requires {env_var}. Get one at {signup_url}")
+    try:
+        key = input(f"  Enter {env_var} (or press Enter to abort): ").strip()
+    except EOFError:
+        return ""
+    if not key:
+        return ""
+    os.environ[env_var] = key
+    try:
+        env_path = (
+            Path("/workspace/.env")
+            if Path("/workspace/.env").parent.exists()
+            else Path(__file__).resolve().parent / ".env"
+        )
+        with env_path.open("a", encoding="utf-8") as f:
+            f.write(f"\n{env_var}={key}\n")
+    except OSError:
+        pass
+    return key
+
+
 # Normalize the various HF token env var names HF libraries accept.
 _hf_tok = (
     os.environ.get("HF_TOKEN")
@@ -132,8 +166,8 @@ class PipelineConfig:
 
     # Diarization — pyannote.audio (optional, requires HF token)
     use_diarization: bool = False
-    diarization_model: str = "pyannote/speaker-diarization-3.1"
-    diarization_min_speakers: int = 1
+    diarization_model: str = "pyannote/speaker-diarization-community-1"
+    diarization_min_speakers: int = 2
     diarization_max_speakers: int = 10
     diarization_profile_duration: float = 25.0   # seconds of audio to collect per speaker
 
@@ -159,7 +193,9 @@ class PipelineConfig:
     tts_speaker_duration: float = 25.0
     tts_speaker_skip: float = 20.0         # skip past intro/title cards
 
-    # TTS — VoxCPM2 primary, XTTS v2 fallback
+    # TTS — engine selection
+    # voxcpm2|xtts2 run locally on GPU; edge-tts|qwen3-tts|gemini-tts are cloud APIs.
+    tts_engine: str = "voxcpm2"
     tts_model: str = "openbmb/VoxCPM2"
     tts_max_stretch: float = 1.10
     tts_cfg_value: float = 2.5
@@ -167,6 +203,18 @@ class PipelineConfig:
     # Ultimate Cloning passes the reference transcript. For cross-lingual dubbing
     # (English reference → French output) it tends to bleed English phonemes.
     tts_use_prompt_text: bool = False
+
+    # Cloud TTS — voice + model selection (engine-specific, ignored when unused)
+    edge_tts_voice: str = "fr-FR-DeniseNeural"
+    edge_tts_voice_ca: str = "fr-CA-SylvieNeural"
+    qwen_tts_model: str = "qwen3-tts-flash"
+    qwen_tts_voice: str = "Cherry"
+    dashscope_api_key: str = ""
+    gemini_tts_model: str = "gemini-2.5-flash-preview-tts"
+    gemini_tts_voice: str = "Kore"
+
+    # Output loudness — applied after peak normalize, hard-clipped at ±1.0.
+    output_volume_boost_pct: float = 0.0
 
     # HuggingFace token — required for gated models (EuroLLM-9B-Instruct)
     huggingface_token: str = ""
@@ -239,7 +287,7 @@ def load_config(path: str) -> PipelineConfig:
         demucs_model=sep.get("model", "htdemucs"),
         preserve_background=sep.get("preserve_background", True),
         use_diarization=c.get("diarization", {}).get("enabled", False),
-        diarization_model=c.get("diarization", {}).get("model", "pyannote/speaker-diarization-3.1"),
+        diarization_model=c.get("diarization", {}).get("model", "pyannote/speaker-diarization-community-1"),
         diarization_min_speakers=c.get("diarization", {}).get("min_speakers", 1),
         diarization_max_speakers=c.get("diarization", {}).get("max_speakers", 10),
         diarization_profile_duration=c.get("diarization", {}).get("profile_duration", 25.0),
@@ -256,11 +304,23 @@ def load_config(path: str) -> PipelineConfig:
         use_deepfilter=tts.get("use_deepfilter", True),
         tts_speaker_duration=tts.get("speaker_profile_duration", 25.0),
         tts_speaker_skip=tts.get("speaker_profile_skip", 20.0),
+        tts_engine=tts.get("engine", "voxcpm2"),
         tts_model=tts.get("model", "openbmb/VoxCPM2"),
         tts_max_stretch=tts.get("max_stretch", 1.10),
         tts_cfg_value=tts.get("cfg_value", 2.5),
         tts_inference_timesteps=tts.get("inference_timesteps", 24),
         tts_use_prompt_text=tts.get("use_prompt_text", False),
+        edge_tts_voice=tts.get("edge_tts_voice", "fr-FR-DeniseNeural"),
+        edge_tts_voice_ca=tts.get("edge_tts_voice_ca", "fr-CA-SylvieNeural"),
+        qwen_tts_model=tts.get("qwen_tts_model", "qwen3-tts-flash"),
+        qwen_tts_voice=tts.get("qwen_tts_voice", "Cherry"),
+        dashscope_api_key=(
+            tts.get("dashscope_api_key", "")
+            or os.environ.get("DASHSCOPE_API_KEY", "")
+        ),
+        gemini_tts_model=tts.get("gemini_tts_model", "gemini-2.5-flash-preview-tts"),
+        gemini_tts_voice=tts.get("gemini_tts_voice", "Kore"),
+        output_volume_boost_pct=float(aud.get("volume_boost_pct", 0.0)),
         huggingface_token=(
             t.get("huggingface_token", "")
             or os.environ.get("HF_TOKEN", "")
@@ -649,7 +709,7 @@ def diarize_audio(
     Returns a list of (start_s, end_s, speaker_label) tuples, or None on failure.
     Requires: pip install pyannote.audio
     The HF token must have accepted the model license at:
-      https://huggingface.co/pyannote/speaker-diarization-3.1
+      https://huggingface.co/pyannote/speaker-diarization-community-1
     """
     try:
         from pyannote.audio import Pipeline as PyannotePipeline
@@ -660,20 +720,40 @@ def diarize_audio(
         )
         return None
 
+    import warnings
+    tok_tail = hf_token[-4:] if hf_token else "none"
     try:
-        log.info(f"Loading diarization model: {model_name} …")
-        pipeline = PyannotePipeline.from_pretrained(model_name, token=hf_token)
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        pipeline.to(device)
+        log.info(f"Loading diarization model: {model_name} (HF token …{tok_tail})")
+        try:
+            audio_info = sf.info(wav_path)
+            log.info(
+                f"  Input audio: {audio_info.duration:.1f}s, "
+                f"{audio_info.samplerate} Hz, {audio_info.channels}ch"
+            )
+        except Exception as ie:
+            log.debug(f"  sf.info failed: {ie}")
+        # Suppress pyannote's TF32 and pooling std() warnings — cosmetic noise only
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=UserWarning, module="pyannote")
+            pipeline = PyannotePipeline.from_pretrained(model_name, token=hf_token)
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            pipeline.to(device)
 
-        diarize_kwargs: dict = {}
-        if min_speakers > 1:
-            diarize_kwargs["min_speakers"] = min_speakers
-        if max_speakers < 50:
-            diarize_kwargs["max_speakers"] = max_speakers
+            # Pass min/max whenever the user has set them (not just min > 1).
+            # The previous gate suppressed the floor and let pyannote collapse
+            # to a single speaker on long-form webinars.
+            diarize_kwargs: dict = {}
+            if min_speakers and min_speakers >= 1:
+                diarize_kwargs["min_speakers"] = int(min_speakers)
+            if max_speakers and max_speakers >= max(min_speakers or 1, 1):
+                diarize_kwargs["max_speakers"] = int(max_speakers)
 
-        log.info("Running speaker diarization …")
-        annotation = pipeline(wav_path, **diarize_kwargs)
+            log.info(f"  Pyannote params: {diarize_kwargs}")
+            result = pipeline(wav_path, **diarize_kwargs)
+
+        # pyannote ≥ 3.3 wraps the output in a DiarizeOutput namedtuple;
+        # older versions return an Annotation directly
+        annotation = getattr(result, "annotation", result)
 
         turns = [
             (turn.start, turn.end, speaker)
@@ -681,12 +761,27 @@ def diarize_audio(
         ]
         speaker_ids = sorted({t[2] for t in turns})
         log.info(f"✓ Diarization complete — {len(speaker_ids)} speaker(s): {speaker_ids}")
+
+        # Per-speaker breakdown for debugging silent collapses to one speaker.
+        per_speaker: dict = {}
+        for (t_start, t_end, spk) in turns:
+            per_speaker.setdefault(spk, []).append(t_end - t_start)
+        for spk, durs in sorted(per_speaker.items()):
+            log.info(
+                f"  {spk}: {len(durs)} turns, {sum(durs):.1f}s total, "
+                f"longest {max(durs):.1f}s"
+            )
+
         del pipeline
         free_vram(log)
         return turns
 
     except Exception as e:
-        log.error(f"Diarization failed: {e}")
+        log.error(
+            f"Diarization failed: {e}\n"
+            f"  HF token tail: …{tok_tail}\n"
+            f"  If 401/403: accept the license at https://huggingface.co/{model_name}"
+        )
         return None
 
 
@@ -716,23 +811,23 @@ def build_speaker_profiles(
     profile_duration: float,
     log: logging.Logger,
     use_deepfilter: bool = True,
+    diarization_turns: Optional[List[Tuple[float, float, str]]] = None,
 ) -> dict:
     """Build a per-speaker voice-clone reference clip.
 
-    Collects each speaker's longest utterances (up to profile_duration seconds),
-    concatenates them, resamples to 16 kHz (VoxCPM2 input spec), and optionally
-    denoises. Returns {speaker_id: wav_path} — value is None when a speaker has
-    fewer than 3 s of usable audio.
+    When diarization_turns is provided (preferred), audio is extracted using
+    the precise pyannote turn boundaries — no contamination from adjacent
+    speakers. Falls back to merged Whisper segment boundaries otherwise.
+
+    Collects each speaker's longest turns up to profile_duration seconds,
+    resamples to 16 kHz (VoxCPM2 input spec), and optionally denoises.
+    Returns {speaker_id: wav_path} — value is None when a speaker has fewer
+    than 3 s of usable audio.
     """
     from collections import defaultdict
 
     TARGET_SR = 16000
     MIN_PROFILE_S = 3.0
-
-    by_speaker: dict = defaultdict(list)
-    for seg in segments:
-        spk = seg.get("speaker", "SPEAKER_00")
-        by_speaker[spk].append(seg)
 
     log.info(f"  Loading vocals at {TARGET_SR} Hz for profile extraction …")
     try:
@@ -742,21 +837,34 @@ def build_speaker_profiles(
         return {}
 
     total_s = len(full_audio) / TARGET_SR
+
+    # Build per-speaker list of (start, end) windows.
+    # Prefer raw diarization turns — they are precise and clean.
+    # Fall back to merged segments when turns aren't available.
+    by_speaker: dict = defaultdict(list)
+    if diarization_turns:
+        for t_start, t_end, spk in diarization_turns:
+            by_speaker[spk].append((t_start, t_end))
+    else:
+        for seg in segments:
+            spk = seg.get("speaker", "SPEAKER_00")
+            by_speaker[spk].append((float(seg["start"]), float(seg["end"])))
+
     profiles: dict = {}
 
-    for speaker, spk_segs in by_speaker.items():
-        # Longest segments first — maximises voice fidelity per second collected
-        spk_segs = sorted(spk_segs, key=lambda s: s["end"] - s["start"], reverse=True)
+    for speaker, windows in by_speaker.items():
+        # Longest turns first — maximises voice fidelity per second collected
+        windows = sorted(windows, key=lambda w: w[1] - w[0], reverse=True)
         chunks: List[np.ndarray] = []
         collected = 0.0
 
-        for seg in spk_segs:
+        for (w_start, w_end) in windows:
             if collected >= profile_duration:
                 break
-            s_start = max(0.0, float(seg["start"]))
-            s_end   = min(total_s, float(seg["end"]))
+            s_start = max(0.0, w_start)
+            s_end   = min(total_s, w_end)
             dur     = s_end - s_start
-            if dur < 0.5:
+            if dur < 0.3:
                 continue
             want      = min(dur, profile_duration - collected)
             idx_start = int(s_start * TARGET_SR)
@@ -765,7 +873,10 @@ def build_speaker_profiles(
             collected += want
 
         if not chunks or collected < MIN_PROFILE_S:
-            log.warning(f"  {speaker}: only {collected:.1f}s available — skipping profile (need ≥{MIN_PROFILE_S}s)")
+            log.warning(
+                f"  {speaker}: only {collected:.1f}s available — "
+                f"skipping profile (need ≥{MIN_PROFILE_S}s)"
+            )
             profiles[speaker] = None
             continue
 
@@ -943,16 +1054,17 @@ def _gemini_call(
     log: logging.Logger,
 ) -> Optional[str]:
     try:
-        import google.generativeai as genai
+        from google import genai
+        from google.genai import types
     except ImportError:
-        log.error("google-generativeai not installed. Run: pip install google-generativeai")
+        log.error("google-genai not installed. Run: pip install google-genai")
         return None
     try:
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel(model_name)
-        resp = model.generate_content(
-            prompt,
-            generation_config=genai.types.GenerationConfig(
+        client = genai.Client(api_key=api_key)
+        resp = client.models.generate_content(
+            model=model_name,
+            contents=prompt,
+            config=types.GenerateContentConfig(
                 temperature=temperature,
                 max_output_tokens=4096,
             ),
@@ -971,6 +1083,8 @@ def _parse_numbered(text: str, count: int) -> List[str]:
         m = re.match(r"^[\(\[]?(\d+)[\.\)\]]\s+(.*)", line.strip())
         if m:
             idx, content = int(m.group(1)), m.group(2).strip()
+            # Strip budget annotations that some LLMs echo back: "(MAX 20 chars) ..."
+            content = re.sub(r"^\(MAX\s+\d+\s+chars?\)\s*", "", content, flags=re.IGNORECASE).strip()
             if 1 <= idx <= count and content:
                 result[idx] = content
     return [result.get(i + 1, "") for i in range(count)]
@@ -1620,91 +1734,86 @@ def _get_reference_transcript(
 
 
 # ============================================================================
-# Step 5: TTS Synthesis — VoxCPM2 (XTTS v2 fallback)
+# Step 5: TTS Synthesis — engine dispatcher
+# Local: voxcpm2 | xtts2 (voice cloning, on-GPU)
+# Cloud: edge-tts | qwen3-tts | gemini-tts (fixed voice, no VRAM cost)
 # ============================================================================
 
-def synthesize_all_segments(
-    segments: List[dict],
-    speaker_wav: Optional[str],
-    reference_transcript: str,
-    tts_model_id: str,
-    log: logging.Logger,
-    cfg_value: float = 2.5,
-    inference_timesteps: int = 24,
-    use_prompt_text: bool = False,
-    speaker_profiles: Optional[dict] = None,
-) -> Tuple[List[Tuple[np.ndarray, float, float]], int]:
-    """Synthesize French audio using VoxCPM2 Ultimate Cloning.
+def _seg_text(seg: dict) -> str:
+    return (seg.get("text_fr") or seg.get("text") or "").strip()
 
-    When speaker_profiles is provided (multi-speaker diarization mode), each
-    segment is synthesized with its assigned speaker's voice clone. Falls back
-    to speaker_wav for segments whose speaker has no usable profile.
 
-    Returns (synthesized_segments, sample_rate_hz).
-    Falls back to Coqui XTTS v2 if voxcpm is not installed.
-    """
+def _tts_voxcpm2(
+    segments, speaker_wav, reference_transcript, tts_model_id, log,
+    cfg_value, inference_timesteps, use_prompt_text, speaker_profiles,
+):
+    try:
+        from voxcpm import VoxCPM
+    except ImportError:
+        log.error("voxcpm not installed. Install: pip install voxcpm")
+        return [], 48000
+
     def _pick_wav(seg: dict) -> Optional[str]:
         if speaker_profiles:
-            spk = seg.get("speaker", "SPEAKER_00")
-            profile = speaker_profiles.get(spk)
+            profile = speaker_profiles.get(seg.get("speaker", "SPEAKER_00"))
             if profile and os.path.exists(profile):
                 return profile
         return speaker_wav
 
-    # ── VoxCPM2 ──────────────────────────────────────────────────────────────
-    try:
-        from voxcpm import VoxCPM
+    log.info(f"Loading VoxCPM2: {tts_model_id} …")
+    model = VoxCPM.from_pretrained(tts_model_id)
+    sr = model.tts_model.sample_rate
+    log.info(f"✓ VoxCPM2 ready (output: {sr} Hz)")
 
-        log.info(f"Loading VoxCPM2: {tts_model_id} …")
-        model = VoxCPM.from_pretrained(tts_model_id)
-        sr    = model.tts_model.sample_rate   # 48000
-        log.info(f"✓ VoxCPM2 ready (output: {sr} Hz)")
-
-        synthesized: List[Tuple[np.ndarray, float, float]] = []
-
-        with tqdm(total=len(segments), desc="Synthesizing (VoxCPM2)") as pbar:
-            for seg in segments:
-                text = seg.get("text_fr") or seg["text"]
-                if not text.strip():
-                    pbar.update(1)
-                    continue
-                try:
-                    ref_wav = _pick_wav(seg)
-                    kwargs: dict = {
-                        "text": text,
-                        "cfg_value": cfg_value,
-                        "inference_timesteps": inference_timesteps,
-                        # normalize=False protects French diacritics/digits from
-                        # VoxCPM2's English-centric text normalizer.
-                        "normalize": False,
-                        "retry_badcase": True,
-                        "retry_badcase_max_times": 3,
-                    }
-                    if ref_wav and os.path.exists(ref_wav):
-                        kwargs["reference_wav_path"] = ref_wav
-                        if use_prompt_text and reference_transcript:
-                            kwargs["prompt_text"] = reference_transcript
-                    wav = model.generate(**kwargs)
-                    synthesized.append((np.array(wav, dtype=np.float32), seg["start"], seg["end"]))
-                except Exception as e:
-                    log.warning(f"Segment {seg['id']} VoxCPM2 failed: {e}")
+    synthesized: List[Tuple[np.ndarray, float, float]] = []
+    with tqdm(total=len(segments), desc="Synthesizing (VoxCPM2)") as pbar:
+        for seg in segments:
+            text = _seg_text(seg)
+            if not text:
                 pbar.update(1)
+                continue
+            try:
+                ref_wav = _pick_wav(seg)
+                kwargs: dict = {
+                    "text": text,
+                    "cfg_value": cfg_value,
+                    "inference_timesteps": inference_timesteps,
+                    # normalize=False protects French diacritics/digits from
+                    # VoxCPM2's English-centric text normalizer.
+                    "normalize": False,
+                    "retry_badcase": True,
+                    "retry_badcase_max_times": 3,
+                }
+                if ref_wav and os.path.exists(ref_wav):
+                    kwargs["reference_wav_path"] = ref_wav
+                    if use_prompt_text and reference_transcript:
+                        kwargs["prompt_text"] = reference_transcript
+                wav = model.generate(**kwargs)
+                synthesized.append((np.array(wav, dtype=np.float32), seg["start"], seg["end"]))
+            except Exception as e:
+                log.warning(f"Segment {seg['id']} VoxCPM2 failed: {e}")
+            pbar.update(1)
 
-        log.info(f"✓ Synthesized {len(synthesized)} segments at {sr} Hz")
-        del model
-        free_vram(log)
-        return synthesized, sr
+    log.info(f"✓ Synthesized {len(synthesized)} segments at {sr} Hz")
+    del model
+    free_vram(log)
+    return synthesized, sr
 
-    except ImportError:
-        log.warning("voxcpm not installed — falling back to Coqui XTTS v2. Install: pip install voxcpm")
 
-    # ── XTTS v2 fallback ─────────────────────────────────────────────────────
+def _tts_xtts2(segments, speaker_wav, log, speaker_profiles):
     if not HAS_XTTS:
-        log.error("Neither voxcpm nor Coqui TTS is installed. Cannot synthesize audio.")
+        log.error("coqui-tts not installed. Install: pip install coqui-tts")
         return [], 24000
 
+    def _pick_wav(seg: dict) -> Optional[str]:
+        if speaker_profiles:
+            profile = speaker_profiles.get(seg.get("speaker", "SPEAKER_00"))
+            if profile and os.path.exists(profile):
+                return profile
+        return speaker_wav
+
     xtts_model_name = "tts_models/multilingual/multi-dataset/xtts_v2"
-    log.info(f"Loading XTTS v2 fallback …")
+    log.info("Loading XTTS v2 …")
     sr = 24000
     try:
         tts = CoquiTTS(xtts_model_name).to("cuda")
@@ -1712,11 +1821,11 @@ def synthesize_all_segments(
         log.error(f"XTTS v2 load failed: {e}")
         return [], sr
 
-    synthesized = []
+    synthesized: List[Tuple[np.ndarray, float, float]] = []
     with tqdm(total=len(segments), desc="Synthesizing (XTTS v2)") as pbar:
         for seg in segments:
-            text = seg.get("text_fr") or seg["text"]
-            if not text.strip():
+            text = _seg_text(seg)
+            if not text:
                 pbar.update(1)
                 continue
             try:
@@ -1733,6 +1842,197 @@ def synthesize_all_segments(
     del tts
     free_vram(log)
     return synthesized, sr
+
+
+def _tts_edge(segments, voice, log, temp_dir):
+    """Microsoft Edge cloud TTS — free, no API key, no GPU.
+    Output is 24 kHz mono MP3, decoded to float32 mono via soundfile."""
+    try:
+        import asyncio
+        import edge_tts
+    except ImportError:
+        log.error("edge-tts not installed. Install: pip install edge-tts")
+        return [], 24000
+
+    sr = 24000
+    log.info(f"Using edge-tts voice: {voice}")
+    synthesized: List[Tuple[np.ndarray, float, float]] = []
+    out_path = os.path.join(temp_dir, "_edge_seg.mp3")
+
+    async def _gen(text: str) -> bytes:
+        comm = edge_tts.Communicate(text, voice)
+        chunks: List[bytes] = []
+        async for ev in comm.stream():
+            if ev.get("type") == "audio":
+                chunks.append(ev["data"])
+        return b"".join(chunks)
+
+    with tqdm(total=len(segments), desc="Synthesizing (edge-tts)") as pbar:
+        for seg in segments:
+            text = _seg_text(seg)
+            if not text:
+                pbar.update(1)
+                continue
+            try:
+                audio_bytes = asyncio.run(_gen(text))
+                with open(out_path, "wb") as f:
+                    f.write(audio_bytes)
+                wav, file_sr = librosa.load(out_path, sr=sr, mono=True)
+                synthesized.append((wav.astype(np.float32), seg["start"], seg["end"]))
+            except Exception as e:
+                log.warning(f"Segment {seg['id']} edge-tts failed: {e}")
+            pbar.update(1)
+    try:
+        os.unlink(out_path)
+    except OSError:
+        pass
+    return synthesized, sr
+
+
+def _tts_qwen3(segments, model_name, voice, api_key, log):
+    """Qwen3-TTS via Alibaba DashScope API. Returns 24 kHz mono."""
+    try:
+        import dashscope
+        from dashscope.audio.tts_v2 import SpeechSynthesizer
+    except ImportError:
+        log.error("dashscope not installed. Install: pip install dashscope")
+        return [], 24000
+
+    if not api_key:
+        log.error("DASHSCOPE_API_KEY not set; cannot use qwen3-tts.")
+        return [], 24000
+
+    dashscope.api_key = api_key
+    sr = 24000
+    log.info(f"Using Qwen3-TTS model={model_name} voice={voice}")
+    synthesized: List[Tuple[np.ndarray, float, float]] = []
+
+    with tqdm(total=len(segments), desc="Synthesizing (qwen3-tts)") as pbar:
+        for seg in segments:
+            text = _seg_text(seg)
+            if not text:
+                pbar.update(1)
+                continue
+            try:
+                synth = SpeechSynthesizer(model=model_name, voice=voice)
+                audio_bytes = synth.call(text)
+                if not audio_bytes:
+                    raise RuntimeError("empty response")
+                import io
+                wav, _ = sf.read(io.BytesIO(audio_bytes), dtype="float32")
+                if wav.ndim > 1:
+                    wav = wav.mean(axis=1)
+                if _ != sr:
+                    wav = librosa.resample(wav, orig_sr=_, target_sr=sr)
+                synthesized.append((wav.astype(np.float32), seg["start"], seg["end"]))
+            except Exception as e:
+                log.warning(f"Segment {seg['id']} qwen3-tts failed: {e}")
+            pbar.update(1)
+
+    return synthesized, sr
+
+
+def _tts_gemini(segments, model_name, voice, api_key, log):
+    """Gemini-TTS preview model. Returns 24 kHz mono PCM."""
+    try:
+        from google import genai
+        from google.genai import types
+    except ImportError:
+        log.error("google-genai not installed. Install: pip install google-genai")
+        return [], 24000
+
+    if not api_key:
+        log.error("GEMINI_API_KEY not set; cannot use gemini-tts.")
+        return [], 24000
+
+    client = genai.Client(api_key=api_key)
+    sr = 24000
+    log.info(f"Using Gemini-TTS model={model_name} voice={voice}")
+    synthesized: List[Tuple[np.ndarray, float, float]] = []
+
+    with tqdm(total=len(segments), desc="Synthesizing (gemini-tts)") as pbar:
+        for seg in segments:
+            text = _seg_text(seg)
+            if not text:
+                pbar.update(1)
+                continue
+            try:
+                resp = client.models.generate_content(
+                    model=model_name,
+                    contents=text,
+                    config=types.GenerateContentConfig(
+                        response_modalities=["AUDIO"],
+                        speech_config=types.SpeechConfig(
+                            voice_config=types.VoiceConfig(
+                                prebuilt_voice_config=types.PrebuiltVoiceConfig(
+                                    voice_name=voice,
+                                )
+                            )
+                        ),
+                    ),
+                )
+                pcm = resp.candidates[0].content.parts[0].inline_data.data
+                # Gemini-TTS returns 24 kHz signed 16-bit little-endian PCM.
+                wav = np.frombuffer(pcm, dtype="<i2").astype(np.float32) / 32768.0
+                synthesized.append((wav, seg["start"], seg["end"]))
+            except Exception as e:
+                log.warning(f"Segment {seg['id']} gemini-tts failed: {e}")
+            pbar.update(1)
+
+    return synthesized, sr
+
+
+def synthesize_all_segments(
+    segments: List[dict],
+    speaker_wav: Optional[str],
+    reference_transcript: str,
+    config: "PipelineConfig",
+    log: logging.Logger,
+    speaker_profiles: Optional[dict] = None,
+    temp_dir: str = "/tmp",
+) -> Tuple[List[Tuple[np.ndarray, float, float]], int]:
+    """Dispatch to the configured TTS engine.
+
+    Returns (synthesized_segments, sample_rate_hz).
+    For cloud engines (edge-tts/qwen3-tts/gemini-tts), speaker_profiles and
+    speaker_wav are ignored — those engines use a fixed configured voice.
+    """
+    engine = (config.tts_engine or "voxcpm2").lower()
+
+    if speaker_profiles and engine in ("edge-tts", "qwen3-tts", "gemini-tts"):
+        log.info(
+            f"  Multi-speaker diarization detected but {engine} uses a fixed "
+            "voice; per-speaker voicing is disabled."
+        )
+
+    if engine == "voxcpm2":
+        return _tts_voxcpm2(
+            segments, speaker_wav, reference_transcript, config.tts_model, log,
+            config.tts_cfg_value, config.tts_inference_timesteps,
+            config.tts_use_prompt_text, speaker_profiles,
+        )
+    if engine == "xtts2":
+        return _tts_xtts2(segments, speaker_wav, log, speaker_profiles)
+    if engine == "edge-tts":
+        voice = (
+            config.edge_tts_voice_ca
+            if config.locale == "fr-ca"
+            else config.edge_tts_voice
+        )
+        return _tts_edge(segments, voice, log, temp_dir)
+    if engine == "qwen3-tts":
+        return _tts_qwen3(
+            segments, config.qwen_tts_model, config.qwen_tts_voice,
+            config.dashscope_api_key, log,
+        )
+    if engine == "gemini-tts":
+        return _tts_gemini(
+            segments, config.gemini_tts_model, config.gemini_tts_voice,
+            config.gemini_api_key, log,
+        )
+
+    log.error(f"Unknown TTS engine: {engine!r}")
+    return [], 24000
 
 
 # ============================================================================
@@ -1829,6 +2129,7 @@ def assemble_and_encode(
     max_stretch: float,
     temp_dir: str,
     log: logging.Logger,
+    volume_boost_pct: float = 0.0,
 ) -> bool:
     """Place each synthesized segment into the timeline.
 
@@ -1893,6 +2194,12 @@ def assemble_and_encode(
     peak = np.max(np.abs(assembled))
     if peak > 0:
         assembled *= 0.95 / peak
+    if volume_boost_pct:
+        gain = 1.0 + volume_boost_pct / 100.0
+        assembled = np.clip(assembled * gain, -1.0, 1.0)
+        log.info(
+            f"  Applied {volume_boost_pct:+.0f}% volume boost (gain {gain:.2f}×)"
+        )
 
     sf.write(wav_path, assembled, src_rate)
     log.info(f"✓ WAV assembled: {os.path.getsize(wav_path) / 1e6:.1f} MB")
@@ -1923,24 +2230,29 @@ def remix_with_background(
     output_aac: str,
     log: logging.Logger,
     bg_gain_db: float = -3.0,
+    volume_boost_pct: float = 0.0,
 ) -> bool:
     """Mix French dubbed vocals with the original background (music, ambient sound).
 
     The background is attenuated by 3 dB so dialogue stays intelligible.
     Produces a second output file (_french_full.m4a) alongside the dry dub.
+    The same volume boost applied to the bare-vocals output is applied here so
+    the two outputs match in loudness.
     """
     log.info("Re-mixing French vocals with original background …")
+    voice_gain = 1.0 + (volume_boost_pct or 0.0) / 100.0
+    filt = (
+        f"[0:a]volume={voice_gain:.3f}[v];"
+        f"[1:a]volume={bg_gain_db}dB[bg];"
+        "[v][bg]amix=inputs=2:duration=first[out]"
+    )
     try:
         subprocess.run(
             [
                 "ffmpeg", "-y",
                 "-i", french_wav,
                 "-i", no_vocals_wav,
-                "-filter_complex",
-                (
-                    f"[1:a]volume={bg_gain_db}dB[bg];"
-                    "[0:a][bg]amix=inputs=2:duration=first[out]"
-                ),
+                "-filter_complex", filt,
                 "-map", "[out]",
                 "-ar", "48000", "-ac", "2",
                 "-c:a", "aac", "-b:a", "192k",
@@ -2114,12 +2426,33 @@ def process_video(
         if not check_ollama(config.translation_model, log):
             return False
 
-    if config.translation_backend == "gemini":
-        if not config.gemini_api_key:
+    needs_gemini_key = (
+        config.translation_backend == "gemini"
+        or config.tts_engine == "gemini-tts"
+    )
+    if needs_gemini_key and not config.gemini_api_key:
+        config.gemini_api_key = _prompt_and_persist_key(
+            "GEMINI_API_KEY", "Gemini",
+            "https://aistudio.google.com/app/apikey",
+        )
+    if needs_gemini_key and not config.gemini_api_key:
+        log.error(
+            "GEMINI_API_KEY not set; aborting.\n"
+            "  Get a key at https://aistudio.google.com/app/apikey, then either:\n"
+            "    export GEMINI_API_KEY=your_key\n"
+            "  or set translation.gemini_api_key in config.yaml"
+        )
+        return False
+
+    if config.tts_engine == "qwen3-tts" and not config.dashscope_api_key:
+        config.dashscope_api_key = _prompt_and_persist_key(
+            "DASHSCOPE_API_KEY", "Qwen3-TTS (DashScope)",
+            "https://dashscope.console.aliyun.com/apiKey",
+        )
+        if not config.dashscope_api_key:
             log.error(
-                "GEMINI_API_KEY not set.\n"
-                "  Get a key at https://aistudio.google.com/app/apikey\n"
-                "  Then: export GEMINI_API_KEY=your_key  or set translation.gemini_api_key in config.yaml"
+                "DASHSCOPE_API_KEY not set; cannot use qwen3-tts.\n"
+                "  Get a key at https://dashscope.console.aliyun.com/apiKey"
             )
             return False
 
@@ -2179,9 +2512,10 @@ def process_video(
     )
 
     # ── 2c. Speaker diarization (optional) ────────────────────────────────────
+    diarization_turns: Optional[List[Tuple[float, float, str]]] = None
     if config.use_diarization:
         log.info("\n[2c/7] SPEAKER DIARIZATION (pyannote.audio)")
-        turns = diarize_audio(
+        diarization_turns = diarize_audio(
             vocals_wav,
             config.diarization_model,
             config.huggingface_token,
@@ -2189,9 +2523,9 @@ def process_video(
             config.diarization_max_speakers,
             log,
         )
-        if turns:
-            segments = assign_speakers(segments, turns)
-            speaker_counts = {}
+        if diarization_turns:
+            segments = assign_speakers(segments, diarization_turns)
+            speaker_counts: dict = {}
             for seg in segments:
                 spk = seg.get("speaker", "?")
                 speaker_counts[spk] = speaker_counts.get(spk, 0) + 1
@@ -2288,7 +2622,9 @@ def process_video(
     speaker_profiles: Optional[dict] = None
 
     if config.use_diarization and any("speaker" in s for s in segments):
-        # Multi-speaker: build a profile clip for every detected speaker
+        # Multi-speaker: build a profile clip for every detected speaker.
+        # Pass raw diarization turns so each speaker's audio is extracted
+        # from their precise turn boundaries, not contaminated merged chunks.
         speaker_profiles = build_speaker_profiles(
             vocals_wav,
             segments,
@@ -2296,6 +2632,7 @@ def process_video(
             config.diarization_profile_duration,
             log,
             use_deepfilter=config.use_deepfilter,
+            diarization_turns=diarization_turns,
         )
         valid = sum(1 for v in speaker_profiles.values() if v)
         log.info(f"  Built {valid}/{len(speaker_profiles)} speaker profile(s)")
@@ -2336,18 +2673,16 @@ def process_video(
         log.info(f"  Reference transcript ({len(reference_transcript)} chars): "
                  f"{reference_transcript[:80]}…")
 
-    # ── 5. TTS synthesis (VoxCPM2) ────────────────────────────────────────────
-    log.info("\n[5/7] SYNTHESIZING FRENCH AUDIO (VoxCPM2)")
+    # ── 5. TTS synthesis ──────────────────────────────────────────────────────
+    log.info(f"\n[5/7] SYNTHESIZING FRENCH AUDIO ({config.tts_engine})")
     synthesized, actual_sr = synthesize_all_segments(
         segments,
         speaker_wav,
         reference_transcript,
-        config.tts_model,
+        config,
         log,
-        cfg_value=config.tts_cfg_value,
-        inference_timesteps=config.tts_inference_timesteps,
-        use_prompt_text=config.tts_use_prompt_text,
         speaker_profiles=speaker_profiles,
+        temp_dir=temp_dir,
     )
     if not synthesized:
         return False
@@ -2367,13 +2702,17 @@ def process_video(
         max_stretch=config.tts_max_stretch,
         temp_dir=temp_dir,
         log=log,
+        volume_boost_pct=config.output_volume_boost_pct,
     ):
         return False
 
     # Optional background re-mix (French vocals + original music/ambience)
     if config.preserve_background and no_vocals_wav and os.path.exists(no_vocals_wav):
         remixed_aac = os.path.join(output_dir, f"{name}_french_full.m4a")
-        if remix_with_background(interim_wav, no_vocals_wav, remixed_aac, log):
+        if remix_with_background(
+            interim_wav, no_vocals_wav, remixed_aac, log,
+            volume_boost_pct=config.output_volume_boost_pct,
+        ):
             log.info(f"  Full mix (vocals + background): {Path(remixed_aac).name}")
 
     # ── 7. Subtitles ──────────────────────────────────────────────────────────
@@ -2440,13 +2779,55 @@ def process_video(
         "Defaults to translation.locale in config.yaml."
     ),
 )
-def main(video: str, output_dir: str, config_path: str, force: bool, translator: Optional[str], locale: Optional[str]) -> None:
+@click.option(
+    "--tts",
+    type=click.Choice(
+        ["voxcpm2", "xtts2", "edge-tts", "qwen3-tts", "gemini-tts"],
+        case_sensitive=False,
+    ),
+    default=None,
+    help=(
+        "TTS engine override. "
+        "'voxcpm2' = on-GPU 48 kHz, voice cloning (default). "
+        "'xtts2' = on-GPU Coqui XTTS v2 fallback. "
+        "'edge-tts' = Microsoft Edge cloud, free, fixed voice. "
+        "'qwen3-tts' = Alibaba DashScope API (needs DASHSCOPE_API_KEY). "
+        "'gemini-tts' = Google Gemini-TTS preview (needs GEMINI_API_KEY). "
+        "Defaults to tts.engine in config.yaml."
+    ),
+)
+@click.option(
+    "--volume-boost",
+    type=float,
+    default=None,
+    help=(
+        "Boost output loudness by this percent (e.g. 20 → +20%). "
+        "Applied after peak normalization; hard-clipped at ±1.0. "
+        "Defaults to audio.volume_boost_pct in config.yaml (0 = off)."
+    ),
+)
+def main(
+    video: str,
+    output_dir: str,
+    config_path: str,
+    force: bool,
+    translator: Optional[str],
+    locale: Optional[str],
+    tts: Optional[str],
+    volume_boost: Optional[float],
+) -> None:
     """Dub a single video to French (audio track + SRT subtitles).
 
     Compare backends:
       --translator eurollm --output-dir /workspace/outputs/eurollm
       --translator qwen    --output-dir /workspace/outputs/qwen
       --translator gemini  --output-dir /workspace/outputs/gemini
+
+    Pick a TTS engine:
+      --tts voxcpm2     # on-GPU 48 kHz, clones speaker voice (default)
+      --tts edge-tts    # free Microsoft cloud, no key required
+      --tts gemini-tts  # Google Gemini-TTS (GEMINI_API_KEY)
+      --tts qwen3-tts   # Alibaba DashScope (DASHSCOPE_API_KEY)
 
     Canadian French:
       --locale fr-ca
@@ -2460,6 +2841,10 @@ def main(video: str, output_dir: str, config_path: str, force: bool, translator:
         config.translation_backend = translator.lower()
     if locale:
         config.locale = locale.lower()
+    if tts:
+        config.tts_engine = tts.lower()
+    if volume_boost is not None:
+        config.output_volume_boost_pct = float(volume_boost)
     log     = setup_logging(config.logs_folder, Path(video).stem)
     success = process_video(video, output_dir, config, log, force=force)
     sys.exit(0 if success else 1)
