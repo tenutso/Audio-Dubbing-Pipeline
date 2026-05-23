@@ -962,8 +962,10 @@ Translate each numbered English segment into natural, conversational {language}
 that fits a strict character budget for lip-sync.
 
 CRITICAL RULES:
-- Each segment has a "(MAX N chars)" budget. Your translation MUST fit within it.
-- Be BRUTALLY concise: remove fillers, redundancies, and secondary details.
+- HARD CONSTRAINT: The translation MUST be LESS THAN OR EQUAL TO the "(MAX N chars)" budget.
+- Count the characters of your translation BEFORE outputting. If it exceeds the budget, rewrite it to be shorter.
+- If necessary to save space, summarize the core meaning and drop fluff words (e.g., "en fait", "donc", "nous allons").
+- Prioritize ultra-short synonyms (e.g., use "utiliser" instead of "se servir de").
 - Use contractions, spoken-language forms, and shorter synonyms.
 - Adapt idioms naturally; do not translate literally.
 - Preserve key technical terms and proper nouns.
@@ -1205,12 +1207,19 @@ def translate_segments(
         return [dict(s) for s in segments]
 
     try:
-        from transformers import AutoModelForCausalLM, AutoTokenizer
+        from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
-        tokenizer   = AutoTokenizer.from_pretrained(eurollm_model_name, token=hf_token)
+        tokenizer = AutoTokenizer.from_pretrained(eurollm_model_name, token=hf_token)
         load_kwargs: dict = {"device_map": "cuda", "token": hf_token}
+
         if use_quantize:
-            load_kwargs["load_in_8bit"] = True
+            # This replaces load_in_8bit and uses highly optimized 4-bit quantization instead
+            load_kwargs["quantization_config"] = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_compute_dtype=torch.bfloat16,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_use_double_quant=True
+            )
         else:
             load_kwargs["torch_dtype"] = torch.bfloat16
 

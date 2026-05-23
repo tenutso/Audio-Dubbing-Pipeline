@@ -110,7 +110,7 @@ translation:
   model: qwen3:14b
   temperature: 0.3
   batch_size: 10
-  review_pass: true
+  review_pass: false
 
   # Target language for the dub.  Drives the LANG_CPS budget table, the
   # translation/review prompts, and the WhisperX alignment model.
@@ -131,7 +131,7 @@ translation:
   # Multiplier on the per-segment character budget (1.1 = +10% headroom).
   # Raise toward 1.2 if the dub feels too terse; lower toward 1.0 if French
   # still races.  Effective budget = duration_s × LANG_CPS[lang] × cps_safety.
-  cps_safety: 1.1
+  cps_safety: 0.85
 
   # Run a second, unconstrained translation pass for SRT readability.
   # Doubles EuroLLM cost but produces nicer-reading subtitles (the length-fitted
@@ -188,7 +188,7 @@ tts:
   # been told to fit a CPS-budgeted translation.  Should rarely trigger now that
   # translation is length-aware.  Beyond this ratio we truncate with an 80 ms
   # fade-out instead of speeding up further (preserves voice quality).
-  max_stretch: 1.10
+  max_stretch: 1.25
 
   # VoxCPM2 inference quality knobs.
   # cfg_value: LM guidance strength.  Higher = better adherence to prompt voice
@@ -205,7 +205,7 @@ tts:
   # Merge consecutive Whisper fragments into sentence-level chunks before TTS.
   # Sub-second fragments synthesized individually produce choppy, robotic output.
   segment_merge_gap: 0.8           # max silence gap (s) to merge across
-  segment_merge_max_duration: 8.0  # max merged chunk length (s)
+  segment_merge_max_duration: 5.0  # max merged chunk length (s)
 
 # ============================================================
 # Subtitles
