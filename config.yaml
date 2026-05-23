@@ -109,7 +109,7 @@ translation:
   # Thinking mode is suppressed (/no_think) for translation tasks.
   model: qwen3:14b
   temperature: 0.3
-  batch_size: 10
+  batch_size: 64
   review_pass: false
 
   # Target language for the dub.  Drives the LANG_CPS budget table, the
