@@ -14,8 +14,6 @@ async function loadOptions() {
   const r = await fetch("/api/options");
   if (!r.ok) return;
   const data = await r.json();
-  fillSelect("translator", data.translators, data.defaults.translator);
-  fillSelect("tts", data.tts, data.defaults.tts);
   fillSelect("locale", data.locales, data.defaults.locale);
   $("#volume_boost").value = data.defaults.volume_boost ?? 0;
 }
@@ -48,8 +46,6 @@ async function refreshHealth() {
     if (h.disk_free_gb != null) parts.push(`disk ${h.disk_free_gb} GB free`);
     parts.push(`ollama ${h.ollama_up ? "✓" : "✗"}`);
     parts.push(`HF ${h.hf_token_present ? "✓" : "—"}`);
-    parts.push(`Gemini ${h.gemini_key_present ? "✓" : "—"}`);
-    parts.push(`DashScope ${h.dashscope_key_present ? "✓" : "—"}`);
     $("#health").textContent = parts.join(" · ");
   } catch (e) {
     $("#health").textContent = "health check failed";
@@ -188,8 +184,6 @@ function renderCard(job) {
 
   const meta = [];
   const o = job.options || {};
-  if (o.translator) meta.push(`tr:${o.translator}`);
-  if (o.tts) meta.push(`tts:${o.tts}`);
   if (o.locale) meta.push(o.locale);
   if (o.volume_boost != null) meta.push(`+${o.volume_boost}%`);
   if (o.force) meta.push("force");
@@ -274,8 +268,8 @@ function appendLog(jobId, line) {
   const card = document.querySelector(`.job[data-id="${jobId}"]`);
   if (!card) return;
   const phaseEl = card.querySelector(".job-phase");
-  const phaseMatch = line.match(/\[(\d+)\/7\]\s+(.+)/);
-  if (phaseMatch) phaseEl.textContent = `[${phaseMatch[1]}/7] ${phaseMatch[2]}`;
+  const phaseMatch = line.match(/\[(\d+)\/6\]\s+(.+)/);
+  if (phaseMatch) phaseEl.textContent = `[${phaseMatch[1]}/6] ${phaseMatch[2]}`;
   const logEl = card.querySelector(".job-log");
   const wasScrolled = logEl.scrollTop + logEl.clientHeight + 20 >= logEl.scrollHeight;
   logEl.textContent += (logEl.textContent ? "\n" : "") + line;

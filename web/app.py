@@ -48,17 +48,12 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 # ── Choices (mirror Click definitions in 02_pipeline.py) ──────────────────────
-TRANSLATOR_CHOICES = ["eurollm", "qwen", "gemini"]
-TTS_CHOICES = [
-    "voxcpm2", "xtts2", "edge-tts",
-    "qwen3-tts", "qwen3-tts-local", "gemini-tts",
-]
 LOCALE_CHOICES = ["fr", "fr-ca"]
 
 MAX_UPLOAD_BYTES = 5 * 1024 * 1024 * 1024  # 5 GB
 LOG_BUFFER_LINES = 500
 
-PHASE_RE = re.compile(r"\[(\d+)/7\]\s+(.+)")
+PHASE_RE = re.compile(r"\[(\d+)/6\]\s+(.+)")
 
 log = logging.getLogger("dubbing.web")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -115,10 +110,6 @@ async def _run_job(job: Job) -> None:
     opts = job.options or {}
     if opts.get("force"):
         cmd.append("--force")
-    if opts.get("translator"):
-        cmd += ["--translator", opts["translator"]]
-    if opts.get("tts"):
-        cmd += ["--tts", opts["tts"]]
     if opts.get("locale"):
         cmd += ["--locale", opts["locale"]]
     if opts.get("volume_boost") not in (None, ""):
@@ -156,7 +147,7 @@ async def _run_job(job: Job) -> None:
                 continue
             m = PHASE_RE.search(line)
             if m:
-                job.phase = f"[{m.group(1)}/7] {m.group(2)}".strip()
+                job.phase = f"[{m.group(1)}/6] {m.group(2)}".strip()
             state.publish(job.id, line)
     except Exception as e:
         state.publish(job.id, f"!!! log-stream error: {e}")
@@ -257,8 +248,6 @@ async def index() -> HTMLResponse:
 @app.get("/api/options")
 async def options() -> JSONResponse:
     defaults = {
-        "translator": "eurollm",
-        "tts": "voxcpm2",
         "locale": "fr",
         "volume_boost": 0,
     }
@@ -266,15 +255,11 @@ async def options() -> JSONResponse:
         if CONFIG_PATH.exists():
             with CONFIG_PATH.open(encoding="utf-8") as f:
                 cfg = yaml.safe_load(f) or {}
-            defaults["translator"] = cfg.get("translation", {}).get("backend", defaults["translator"])
-            defaults["tts"] = cfg.get("tts", {}).get("engine", defaults["tts"])
             defaults["locale"] = cfg.get("translation", {}).get("locale", defaults["locale"])
             defaults["volume_boost"] = cfg.get("audio", {}).get("volume_boost_pct", defaults["volume_boost"])
     except Exception as e:
         log.warning("failed to read config defaults: %s", e)
     return JSONResponse({
-        "translators": TRANSLATOR_CHOICES,
-        "tts": TTS_CHOICES,
         "locales": LOCALE_CHOICES,
         "defaults": defaults,
         "config_path": str(CONFIG_PATH),
@@ -284,17 +269,11 @@ async def options() -> JSONResponse:
 @app.post("/api/jobs")
 async def submit(
     video: UploadFile = File(...),
-    translator: str = Form(""),
-    tts: str = Form(""),
     locale: str = Form(""),
     volume_boost: str = Form(""),
     force: str = Form(""),
 ) -> JSONResponse:
     # Validate options against allow-lists (empty = use config default)
-    if translator and translator not in TRANSLATOR_CHOICES:
-        raise HTTPException(400, f"invalid translator: {translator}")
-    if tts and tts not in TTS_CHOICES:
-        raise HTTPException(400, f"invalid tts engine: {tts}")
     if locale and locale not in LOCALE_CHOICES:
         raise HTTPException(400, f"invalid locale: {locale}")
     vb: Optional[float] = None
@@ -337,8 +316,6 @@ async def submit(
         output_dir=str(output_dir),
         log_path=str(log_path),
         options={
-            "translator": translator or None,
-            "tts": tts or None,
             "locale": locale or None,
             "volume_boost": vb,
             "force": force.lower() in ("1", "true", "on", "yes"),
@@ -477,8 +454,6 @@ async def health() -> JSONResponse:
         "pipeline_present": PIPELINE_PY.exists(),
         "config_present": CONFIG_PATH.exists(),
         "hf_token_present": bool(os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")),
-        "gemini_key_present": bool(os.environ.get("GEMINI_API_KEY")),
-        "dashscope_key_present": bool(os.environ.get("DASHSCOPE_API_KEY")),
     }
     # Disk free
     try:

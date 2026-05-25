@@ -1,4 +1,4 @@
-# French Dubbing Pipeline v3.0 — Configuration
+# French Dubbing Pipeline v4.0 — Configuration
 # Place at /workspace/config.yaml
 
 # ============================================================
@@ -15,7 +15,7 @@ pipeline:
 # Audio
 # ============================================================
 audio:
-  # VoxCPM2 native synthesis rate — 48 kHz, higher quality than XTTS (24 kHz)
+  # VoxCPM2 native synthesis rate — 48 kHz
   synthesis_sample_rate: 48000
   # Vimeo accepts both 44100 and 48000 Hz; 48000 avoids resampling loss
   output_sample_rate: 48000
@@ -30,26 +30,21 @@ audio:
 # Requires: pip install pyannote.audio
 # The HF token (translation.huggingface_token or $HF_TOKEN) must
 # have accepted the model license:
-#   https://huggingface.co/pyannote/speaker-diarization-3.1
+#   https://huggingface.co/pyannote/speaker-diarization-community-1
 # ============================================================
 diarization:
   enabled: true
   model: pyannote/speaker-diarization-community-1
-  # Hint the expected speaker range — improves diarization accuracy.
   # Set both to the same number to force an exact speaker count.
-  # min_speakers=2 keeps pyannote from collapsing to one speaker on long-form
-  # webinars; set to 1 only when you know the recording is single-speaker.
   min_speakers: 2
   max_speakers: 10
   # Seconds of each speaker's audio to assemble for their voice clone.
-  # Drawn from their longest utterances, not a fixed time window.
   profile_duration: 25
 
 # ============================================================
 # Source Separation — Demucs
 # Separates speaker vocals from background music/noise before
-# transcription and voice cloning.  Cleaner input → better
-# Whisper accuracy and better voice-clone fidelity.
+# transcription and voice cloning.
 # ============================================================
 source_separation:
   enabled: true
@@ -57,8 +52,8 @@ source_separation:
   # htdemucs_ft → fine-tuned variant, slightly slower
   # mdx_extra   → lighter, good balance of speed and quality
   model: htdemucs
-  # Re-mix the original background track (music, room ambience) back with
-  # the French dubbed vocals into a separate *_french_full.m4a output file.
+  # Re-mix the original background track (music, ambience) back with the
+  # French dubbed vocals into a separate *_french_full.m4a output.
   preserve_background: true
 
 # ============================================================
@@ -73,139 +68,76 @@ whisper:
   compute_type: float16
 
 # ============================================================
-# Translation
-# backend: "eurollm" — EuroLLM-9B-Instruct on-GPU (gated HF model, best quality)
-# backend: "qwen"    — Qwen3:14b via Ollama (no HF token, runs locally)
-# backend: "gemini"  — Gemini API (no local GPU required, needs GEMINI_API_KEY)
-# Override at runtime: --translator eurollm | --translator qwen | --translator gemini
+# Translation — Qwen3 via Ollama
+# Single backend, single pass. The pipeline no longer micromanages
+# per-segment character budgets; the audio assembler handles overflow
+# with atempo (≤ tts.max_stretch) and gap-borrowing.
 # ============================================================
 translation:
-  # Primary backend: "eurollm" or "qwen"
-  backend: eurollm
-
-  # EuroLLM-9B-Instruct — runs on-GPU via HuggingFace transformers
-  eurollm_model: utter-project/EuroLLM-9B-Instruct
-  # 8-bit quantization: ~9 GB VRAM vs ~18 GB in bfloat16.
-  # NOTE: 8-bit is also 2-3× SLOWER than bfloat16 on RTX 4090.
-  # On a 24 GB 4090 with nothing else loaded during translation, bf16 fits
-  # comfortably — set this to false for a major translation speedup.
-  eurollm_quantize: true
-  # HuggingFace token — required for EuroLLM-9B-Instruct (gated model).
-  # Get yours at https://huggingface.co/settings/tokens after requesting
-  # access at https://huggingface.co/utter-project/EuroLLM-9B-Instruct
-  # Leave blank to read from the HF_TOKEN environment variable instead.
-  huggingface_token: ""
-
-  # Gemini API — no local GPU required; set GEMINI_API_KEY env var or fill in below.
-  # Get a free key at https://aistudio.google.com/app/apikey
-  # Models: gemini-2.5-flash (fast/cheap), gemini-2.5-pro (best quality)
-  # Override at runtime: --translator gemini
-  gemini_model: gemini-2.5-flash
-  gemini_api_key: ""
-
-  # Qwen3:14b via Ollama — review pass (both backends) or primary (backend: qwen)
-  # Qwen3 is a clear upgrade from 2.5: better multilingual accuracy, shorter
-  # outputs, and stronger instruction-following on character budgets.
-  # Thinking mode is suppressed (/no_think) for translation tasks.
+  # Qwen3:14b via Ollama. /no_think is sent automatically for qwen3.* tags.
   model: qwen3:14b
   temperature: 0.3
-  batch_size: 64
+  # 20 segments per Ollama call. Bigger batches save calls but risk hitting
+  # the 4096-token output budget if segments are long.
+  batch_size: 20
+  # Optional self-review pass — Qwen rereads its own output and fixes
+  # Anglicisms / register slips. Roughly doubles translation time.
   review_pass: false
 
-  # Target language for the dub.  Drives the LANG_CPS budget table, the
-  # translation/review prompts, and the WhisperX alignment model.
+  # Target language for the dub. Drives the prompt language label.
   # Supported: fr, es, de, it, pt, nl, pl, ru, ja, ko, zh, ar, tr, hi, vi.
   target_lang: fr
 
-  # Locale variant for the target language.
+  # Locale variant.
   # "fr"    → standard European French (default, no glossary applied)
-  # "fr-ca" → Canadian / Québécois French
-  #   Loads the glossary file below and applies two-stage enforcement:
-  #   1. Prompt injection  — vocabulary hints in every translation batch
-  #   2. Post-processing   — deterministic substitution of 'always' terms
-  #   3. Review pass       — Qwen told to use Québécois register explicitly
+  # "fr-ca" → Canadian / Québécois French — loads canadian_glossary.yaml
+  #           and applies prompt injection + 'always'-mode substitution.
   # Override at runtime with: --locale fr-ca
   locale: fr
   glossary_path: /workspace/canadian_glossary.yaml
 
-  # Multiplier on the per-segment character budget (1.1 = +10% headroom).
-  # Raise toward 1.2 if the dub feels too terse; lower toward 1.0 if French
-  # still races.  Effective budget = duration_s × LANG_CPS[lang] × cps_safety.
-  cps_safety: 0.85
-
-  # Run a second, unconstrained translation pass for SRT readability.
-  # Doubles EuroLLM cost but produces nicer-reading subtitles (the length-fitted
-  # text used for audio is sometimes terse to the point of being unnatural).
-  natural_pass: true
+  # HuggingFace token — only used by the diarization gated model.
+  # Leave blank to read from the HF_TOKEN environment variable instead.
+  huggingface_token: ""
 
 # ============================================================
-# Text-to-Speech — engine selection
-# voxcpm2         → on-GPU 48 kHz, voice cloning (default, best quality)
-# xtts2           → on-GPU Coqui XTTS v2, voice cloning, 24 kHz
-# qwen3-tts-local → official Qwen3-TTS 1.7B on-GPU, voice cloning, Apache 2.0, no key
-# edge-tts        → Microsoft Edge cloud, free, fixed voice, no GPU
-# qwen3-tts       → Alibaba DashScope API Flash variant (DASHSCOPE_API_KEY)
-# gemini-tts      → Google Gemini-TTS preview (GEMINI_API_KEY)
-# Override at runtime: --tts voxcpm2 | qwen3-tts-local | edge-tts | qwen3-tts | gemini-tts
-# Cloud engines (edge/qwen3/gemini) ignore speaker_profile_* and
-# diarization-driven per-speaker voicing — they use a fixed configured voice.
+# Text-to-Speech — VoxCPM2
+# 2B diffusion AR model, Apache 2.0, voice cloning, 48 kHz output.
 # ============================================================
 tts:
-  engine: voxcpm2
   model: openbmb/VoxCPM2
-  language: fr
 
-  # edge-tts voices — full list: edge-tts --list-voices | grep fr-
-  edge_tts_voice:    fr-FR-DeniseNeural
-  edge_tts_voice_ca: fr-CA-SylvieNeural   # auto-selected when locale: fr-ca
-
-  # Qwen3-TTS via DashScope. Set DASHSCOPE_API_KEY or fill dashscope_api_key below.
-  # Voices: Cherry, Ethan, Serena, Chelsie, … (see DashScope docs)
-  qwen_tts_model: qwen3-tts-flash
-  qwen_tts_voice: Cherry
-  dashscope_api_key: ""
-
-  # Local Qwen3-TTS (1.7B, Apache 2.0, ungated). Voice-clones from the same
-  # speaker reference VoxCPM2 uses; 24 kHz output. Requires: pip install qwen-tts
-  qwen_tts_local_model: Qwen/Qwen3-TTS-12Hz-1.7B-Base
-
-  # Gemini-TTS preview. Uses translation.gemini_api_key (or GEMINI_API_KEY env).
-  # Voices: Kore, Puck, Charon, Fenrir, Aoede, … (see Gemini docs)
-  gemini_tts_model: gemini-2.5-flash-preview-tts
-  gemini_tts_voice: Kore
-
-  # Speaker reference clip for voice cloning
-  # 25 s gives VoxCPM2 substantially more voice data than 15 s
+  # Speaker reference clip for voice cloning.
+  # 25 s gives VoxCPM2 substantially more voice data than 15 s.
   speaker_profile_duration: 25
-  # Skip this many seconds from the start (avoids intro music / title cards)
+  # Skip this many seconds from the start (avoids intro music / titles).
   speaker_profile_skip: 20
 
   # DeepFilterNet denoising on the speaker reference clip.
-  # Removes room noise / reverb before it reaches the voice cloner.
   use_deepfilter: true
 
-  # Max atempo ratio for segments that still overflow after the LLM has already
-  # been told to fit a CPS-budgeted translation.  Should rarely trigger now that
-  # translation is length-aware.  Beyond this ratio we truncate with an 80 ms
-  # fade-out instead of speeding up further (preserves voice quality).
+  # Max atempo ratio for segments that overflow their window. Beyond this
+  # ratio the segment is truncated with an 80 ms fade-out instead of being
+  # sped up further (preserves voice quality).
   max_stretch: 1.25
 
   # VoxCPM2 inference quality knobs.
-  # cfg_value: LM guidance strength.  Higher = better adherence to prompt voice
-  #   but worse audio quality past ~3.0.  2.5 is a good cross-lingual default.
+  # cfg_value: LM guidance strength. 2.5 is a good cross-lingual default.
   cfg_value: 2.5
-  # inference_timesteps: LocDiT diffusion steps.  Default 10 is fast but noisy;
-  #   24 is the sweet spot for production dubbing.  32 for absolute max quality.
+  # inference_timesteps: LocDiT diffusion steps. 24 is the production sweet
+  # spot; 32 for absolute max quality, 10 for fast preview.
   inference_timesteps: 24
-  # use_prompt_text: Pass the reference audio's transcript to VoxCPM2 ("Ultimate
-  #   Cloning" mode).  Helps same-language cloning, but for cross-lingual dubbing
-  #   (English ref → French output) it bleeds English phonemes — keep false.
+  # use_prompt_text: Pass the reference audio's transcript ("Ultimate Cloning").
+  # For cross-lingual dubbing (English ref → French output) this bleeds English
+  # phonemes — keep false.
   use_prompt_text: false
 
-  # Merge consecutive Whisper fragments into sentence-level chunks before TTS.
-  # Sub-second fragments synthesized individually produce choppy, robotic output.
-  segment_merge_gap: 0.8           # max silence gap (s) to merge across
-  segment_merge_max_duration: 5.0  # max merged chunk length (s)
+  # Merge consecutive Whisper fragments into sentence-scale chunks before TTS.
+  # The v3 sub-second fragments caused robotic prosody AND broken SRT timing;
+  # 2–12 s chunks give the TTS context and keep subtitles readable.
+  segment_merge_gap: 1.5
+  segment_merge_max_duration: 12.0
+  segment_merge_min_duration: 2.0
 
 # ============================================================
 # Subtitles
@@ -213,18 +145,8 @@ tts:
 subtitles:
   format: srt
   encoding: utf-8
-  # WhisperX force-aligns the French text against the assembled French audio,
-  # producing timestamps that match the French speech rather than the original
-  # English timing windows.  This is the correct timing for a Vimeo alternate
-  # audio track.  Requires: pip install whisperx
-  whisperx_alignment: true
   # Shift all subtitles N ms (positive = later, negative = earlier).
-  # Tune if player shows subs consistently early or late after WhisperX.
   sync_offset_ms: 0
-  # Use the natural (unconstrained) translation for SRT text instead of the
-  # length-fitted text used by the TTS.  Better readability; requires
-  # translation.natural_pass: true.  Falls back to the fitted text if missing.
-  use_natural_translation: true
 
 # ============================================================
 # Processing
@@ -232,28 +154,3 @@ subtitles:
 processing:
   max_workers: 1       # keep at 1 — models share 24 GB VRAM
   timeout_seconds: 7200
-
-# ============================================================
-# Profiles — uncomment to override defaults
-# ============================================================
-
-# FAST TESTING (skip heavy models, rough quality):
-# source_separation:
-#   enabled: false
-# whisper:
-#   model: medium
-#   compute_type: int8_float16
-# translation:
-#   eurollm_quantize: true
-#   review_pass: false
-# tts:
-#   use_deepfilter: false
-# subtitles:
-#   whisperx_alignment: false
-
-# MAXIMUM QUALITY (no quantization, full alignment):
-# translation:
-#   eurollm_quantize: false
-#   temperature: 0.2
-# tts:
-#   max_stretch: 1.1

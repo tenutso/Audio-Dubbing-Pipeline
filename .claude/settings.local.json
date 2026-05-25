@@ -2,7 +2,9 @@
   "permissions": {
     "allow": [
       "WebFetch(domain:raw.githubusercontent.com)",
-      "Bash(python -c \"import py_compile, sys; py_compile.compile\\(r'\\\\\\\\wsl.localhost\\\\Ubuntu\\\\home\\\\anijmeh\\\\projects\\\\dubbing\\\\02_pipeline.py', doraise=True\\); print\\('OK'\\)\")"
+      "Bash(python -c \"import py_compile, sys; py_compile.compile\\(r'\\\\\\\\wsl.localhost\\\\Ubuntu\\\\home\\\\anijmeh\\\\projects\\\\dubbing\\\\02_pipeline.py', doraise=True\\); print\\('OK'\\)\")",
+      "Bash(ls -la \"//wsl.localhost/Ubuntu/home/anijmeh/projects/dubbing/\" 2>/dev/null | head -30)",
+      "Read(///wsl.localhost/Ubuntu/home/anijmeh/projects/**)"
     ]
   }
 }
