@@ -514,6 +514,87 @@ def transcribe_audio(
 
 
 # ============================================================================
+# Step 3a: Dedupe Whisper repetition across adjacent segments
+# ============================================================================
+
+def _tokenize_for_dedup(text: str) -> List[str]:
+    """Word-level tokens, lower-cased and stripped of trailing punctuation."""
+    return [w.strip(".,!?;:\"'()[]").lower() for w in text.split() if w.strip(".,!?;:\"'()[]")]
+
+
+def dedupe_whisper_segments(segments: List[dict], log: logging.Logger) -> List[dict]:
+    """Strip word-level overlap between adjacent Whisper segments.
+
+    Whisper's VAD can re-emit the last few words of segment N as the start of
+    segment N+1, especially around hesitations or end-of-audio silence. The
+    duplicate phrase then survives merge_segments, gets translated twice, and
+    appears as a "repeating subtitle" pair in the SRT.
+
+    For each adjacent pair, finds the longest suffix of N's words that matches
+    a prefix of N+1's words (≥ 3 words) and trims that prefix from N+1. If the
+    overlap eats N+1 entirely, drops N+1 and extends N's end.
+    """
+    if len(segments) < 2:
+        return segments
+
+    out: List[dict] = [dict(segments[0])]
+    dropped = 0
+    trimmed = 0
+
+    for seg in segments[1:]:
+        prev = out[-1]
+        prev_words = _tokenize_for_dedup(prev["text"])
+        next_raw   = seg["text"].split()
+        next_words = _tokenize_for_dedup(seg["text"])
+
+        # Find the longest suffix-of-prev == prefix-of-next match (≥ 3 words).
+        max_k = min(len(prev_words), len(next_words), 15)
+        best_k = 0
+        for k in range(max_k, 2, -1):
+            if prev_words[-k:] == next_words[:k]:
+                best_k = k
+                break
+
+        if best_k == 0:
+            out.append(dict(seg))
+            continue
+
+        # Trim the duplicated prefix from seg.text. Re-walk next_raw skipping
+        # tokens that would lower-case-strip to the duplicated words.
+        kept_raw: List[str] = []
+        skipped = 0
+        for raw in next_raw:
+            if skipped < best_k and raw.strip(".,!?;:\"'()[]").lower():
+                skipped += 1
+                continue
+            kept_raw.append(raw)
+        trimmed_text = " ".join(kept_raw).strip()
+
+        if not trimmed_text:
+            # Pure repetition — drop seg entirely, extend prev's end.
+            prev["end"] = max(prev["end"], seg["end"])
+            dropped += 1
+        else:
+            new_seg = dict(seg)
+            new_seg["text"] = trimmed_text
+            out.append(new_seg)
+            trimmed += 1
+
+    for i, s in enumerate(out):
+        s["id"] = i
+
+    if trimmed or dropped:
+        log.info(
+            f"✓ Dedup: trimmed {trimmed} overlapping prefix(es), "
+            f"dropped {dropped} fully-repeated segment(s) "
+            f"({len(segments)} → {len(out)})"
+        )
+    else:
+        log.debug("✓ Dedup: no adjacent-segment overlap detected")
+    return out
+
+
+# ============================================================================
 # Step 3b: Segment merging — into sentence-scale chunks
 # ============================================================================
 
@@ -1419,6 +1500,66 @@ def remix_with_background(
 # Step 8: SRT generation — direct from merged segment timings
 # ============================================================================
 
+def retime_segments_to_audio(
+    segments: List[dict],
+    synthesized: List[Tuple[np.ndarray, float, float]],
+    src_rate: int,
+    total_duration: float,
+    log: logging.Logger,
+) -> List[dict]:
+    """Match each segment's SRT timing to where its dubbed audio actually plays.
+
+    The audio assembler places each TTS chunk at seg["start"] and lets it
+    extend up to the next segment's start (minus a 50 ms crossfade). When the
+    TTS is shorter than the original Whisper window, the dubbed audio finishes
+    early and the rest of the window is silent. Without this retime, the SRT
+    keeps the subtitle on screen through that silence — which the viewer
+    perceives as the subtitles "falling behind" the audio.
+
+    Also drops segments whose TTS produced no audio so the SRT doesn't list
+    entries with nothing playing underneath them.
+    """
+    XFADE_S = _CROSSFADE_MS / 1000.0
+    syn_by_start: dict = {}
+    for audio, start, _end in synthesized:
+        syn_by_start[round(start * 1000)] = audio
+
+    by_start = sorted(segments, key=lambda s: s["start"])
+
+    kept: List[dict] = []
+    dropped = 0
+    tightened = 0
+
+    for i, seg in enumerate(by_start):
+        audio = syn_by_start.get(round(seg["start"] * 1000))
+        if audio is None or len(audio) == 0:
+            dropped += 1
+            continue
+
+        if i + 1 < len(by_start):
+            available = by_start[i + 1]["start"] - seg["start"] - XFADE_S
+        else:
+            available = (total_duration + 2.0) - seg["start"]
+
+        tts_dur  = len(audio) / src_rate
+        played   = min(tts_dur, max(available, 0.5))
+        new_end  = seg["start"] + max(played, 0.5)
+        orig_end = seg["end"]
+
+        new_seg = dict(seg)
+        new_seg["end"] = new_end
+        if abs(new_end - orig_end) > 0.3:
+            tightened += 1
+        kept.append(new_seg)
+
+    if dropped or tightened:
+        log.info(
+            f"  SRT retime: tightened {tightened} entries to actual audio length, "
+            f"dropped {dropped} entries with no synthesized audio"
+        )
+    return kept
+
+
 def _wrap_subtitle(text: str, max_chars: int = 42) -> str:
     if len(text) <= max_chars:
         return text
@@ -1546,6 +1687,8 @@ def process_video(
     if not segments:
         return False
     free_vram(log)
+
+    segments = dedupe_whisper_segments(segments, log)
 
     segments = merge_segments(
         segments,
@@ -1695,7 +1838,10 @@ def process_video(
         ):
             log.info(f"  Full mix (vocals + background): {Path(remixed_aac).name}")
 
-    create_srt(segments, final_srt, log, offset_ms=config.subtitle_offset_ms)
+    srt_segments = retime_segments_to_audio(
+        segments, synthesized, actual_sr, total_duration, log
+    )
+    create_srt(srt_segments, final_srt, log, offset_ms=config.subtitle_offset_ms)
 
     shutil.rmtree(temp_dir, ignore_errors=True)
 

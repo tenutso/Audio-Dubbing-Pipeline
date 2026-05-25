@@ -1,5 +1,5 @@
 #!/bin/bash
-# French Dubbing Pipeline - Setup v2.0
+# French Dubbing Pipeline - Setup v4.0
 # Target: RunPod pytorch:1.0.2-cu1281-torch280-ubuntu2404
 #         (RTX 4090, PyTorch 2.8.0, CUDA 12.8.1, Ubuntu 24.04)
 #
@@ -28,7 +28,7 @@ log_error()   { echo -e "${RED}[$(ts)] ✗ $1${NC}"        | tee -a "$LOGFILE"; 
 die()         { echo -e "${RED}[$(ts)] FATAL: $1${NC}"    | tee -a "$LOGFILE"; exit 1; }
 
 echo "==========================================" | tee -a "$LOGFILE"
-echo "  French Dubbing Pipeline — Setup v3.0"    | tee -a "$LOGFILE"
+echo "  French Dubbing Pipeline — Setup v4.0"    | tee -a "$LOGFILE"
 echo "  $(date)"                                  | tee -a "$LOGFILE"
 echo "==========================================" | tee -a "$LOGFILE"
 
@@ -98,10 +98,10 @@ fi
 
 # ── Step 4: Core scientific stack ─────────────────────────────────────────
 
-log_step "Installing numpy / scipy (pinned for TTS compatibility) …"
+log_step "Installing numpy / scipy …"
 
 if $PYTHON -m pip install --no-cache-dir \
-       "numpy>=1.26.4,<2.0.0" "scipy>=1.13.1" \
+       "numpy>=1.26.4" "scipy>=1.13.1" \
        2>&1 | tail -3 | tee -a "$LOGFILE"; then
     log_success "numpy / scipy installed"
 else
@@ -182,40 +182,15 @@ else
     log_warn "noisereduce install failed — pipeline will fall back to FFmpeg anlmdn"
 fi
 
-# ── Step 8c: EuroLLM dependencies (bitsandbytes + accelerate) ─────────────────
+# ── Step 8c: Speaker diarization — pyannote.audio (gated model) ──────────────
 
-log_step "Installing EuroLLM dependencies (bitsandbytes, accelerate) …"
+log_step "Installing pyannote.audio (speaker diarization) …"
 
-if $PYTHON -m pip install --no-cache-dir \
-       "bitsandbytes>=0.43.0" "accelerate>=0.30.0" \
+if $PYTHON -m pip install --no-cache-dir "pyannote.audio>=3.3.0" \
        2>&1 | tail -3 | tee -a "$LOGFILE"; then
-    log_success "bitsandbytes + accelerate installed"
+    log_success "pyannote.audio installed"
 else
-    log_warn "bitsandbytes/accelerate install failed — EuroLLM will run bfloat16 (~18 GB VRAM)"
-fi
-
-# ── Step 8c-API: Cloud TTS / translation SDKs ─────────────────────────────────
-# edge-tts:    Microsoft Edge free TTS (no key)
-# dashscope:   Alibaba Cloud SDK for Qwen3-TTS
-# google-genai: Unified Google SDK for Gemini translation AND Gemini-TTS
-log_step "Installing cloud TTS / API SDKs (edge-tts, dashscope, google-genai) …"
-
-if $PYTHON -m pip install --no-cache-dir --upgrade \
-       edge-tts dashscope google-genai \
-       2>&1 | tail -3 | tee -a "$LOGFILE"; then
-    log_success "Cloud TTS / API SDKs installed"
-else
-    log_warn "One or more cloud SDK installs failed — affected backends will be unavailable"
-fi
-
-# ── Step 8c-Qwen: Local Qwen3-TTS 1.7B (Apache 2.0, no API key) ───────────────
-log_step "Installing qwen-tts (local Qwen3-TTS 1.7B) …"
-
-if $PYTHON -m pip install --no-cache-dir --upgrade qwen-tts \
-       2>&1 | tail -3 | tee -a "$LOGFILE"; then
-    log_success "qwen-tts installed"
-else
-    log_warn "qwen-tts install failed — qwen3-tts-local engine will be unavailable"
+    log_warn "pyannote.audio install failed — diarization will be unavailable"
 fi
 
 # ── Step 8c-Web: FastAPI web UI dependencies ─────────────────────────────────
@@ -231,53 +206,14 @@ fi
 
 # ── Step 8d: VoxCPM2 TTS ──────────────────────────────────────────────────────
 
-log_step "Installing VoxCPM2 (primary TTS) …"
+log_step "Installing VoxCPM2 (TTS) …"
 
 if $PYTHON -m pip install --no-cache-dir voxcpm \
        2>&1 | tail -3 | tee -a "$LOGFILE"; then
     log_success "VoxCPM2 installed"
 else
-    log_warn "VoxCPM2 install failed — pipeline will fall back to Coqui XTTS v2"
+    log_error "VoxCPM2 install failed — TTS will not work"
 fi
-
-# ── Step 8e: Coqui TTS / XTTS v2 (fallback TTS) ──────────────────────────────
-
-log_step "Installing Coqui TTS / XTTS v2 (fallback) …"
-# The original 'TTS' package was removed from PyPI after Coqui AI dissolved.
-# 'coqui-tts' is the community-maintained fork; same TTS.* import namespace.
-
-TTS_INSTALLED=0
-
-if COQUI_TOS_AGREED=1 $PYTHON -m pip install --no-cache-dir coqui-tts \
-       2>&1 | tail -5 | tee -a "$LOGFILE"; then
-    log_success "coqui-tts installed"
-    TTS_INSTALLED=1
-else
-    log_warn "coqui-tts from PyPI failed — trying GitHub source …"
-    if COQUI_TOS_AGREED=1 $PYTHON -m pip install --no-cache-dir \
-           "git+https://github.com/coqui-ai/TTS.git" \
-           2>&1 | tail -5 | tee -a "$LOGFILE"; then
-        log_success "Coqui TTS installed from GitHub"
-        TTS_INSTALLED=1
-    else
-        log_warn "Coqui TTS install failed — only VoxCPM2 will be available"
-    fi
-fi
-
-# ── Step 8f: WhisperX (SRT forced alignment) ──────────────────────────────────
-
-log_step "Installing WhisperX (SRT force-alignment) …"
-
-if $PYTHON -m pip install --no-cache-dir whisperx \
-       2>&1 | tail -3 | tee -a "$LOGFILE"; then
-    log_success "WhisperX installed"
-else
-    log_warn "WhisperX install failed — SRT will use Whisper timestamps (slightly less accurate)"
-fi
-
-# NOTE: transformers downgrade is NOT attempted here — coqui-tts re-upgrades it
-# during dep resolution and wins every time.  02_pipeline.py patches the
-# missing symbols at runtime (isin_mps_friendly + is_torch_greater_or_equal).
 
 # ── Step 9: Utilities ─────────────────────────────────────────────────────
 
@@ -360,9 +296,9 @@ else
     log_warn "Ollama not reachable — skipping model download. Run: ollama pull qwen3:14b"
 fi
 
-# ── Step 12b: HuggingFace token (EuroLLM-9B is a gated model) ────────────────
+# ── Step 12b: HuggingFace token (pyannote diarization is a gated model) ──────
 
-log_step "Configuring HuggingFace access for EuroLLM-9B-Instruct …"
+log_step "Configuring HuggingFace access for pyannote diarization …"
 
 # Load from project-root .env (where user keeps it) and /workspace/.env if present.
 for envfile in "$SCRIPT_DIR/.env" /workspace/.env; do
@@ -374,8 +310,8 @@ HF_TOKEN="${HF_TOKEN:-${HUGGING_FACE_HUB_TOKEN:-${HUGGINGFACE_HUB_TOKEN:-}}}"
 
 if [[ -z "$HF_TOKEN" ]]; then
     echo ""
-    echo -e "${YELLOW}EuroLLM-9B-Instruct is a gated HuggingFace model.${NC}"
-    echo "  1. Request access: https://huggingface.co/utter-project/EuroLLM-9B-Instruct"
+    echo -e "${YELLOW}pyannote diarization uses a gated HuggingFace model.${NC}"
+    echo "  1. Accept license: https://huggingface.co/pyannote/speaker-diarization-community-1"
     echo "  2. Get your token: https://huggingface.co/settings/tokens (read permission)"
     echo ""
     read -rp "  Enter HuggingFace token (or press Enter to skip): " HF_TOKEN
@@ -401,39 +337,11 @@ except Exception as e:
 " 2>&1 | tee -a "$LOGFILE"; then
         log_success "HuggingFace authenticated — token saved to /workspace/.env"
     else
-        log_warn "HuggingFace token invalid — EuroLLM model download will fail"
+        log_warn "HuggingFace token invalid — diarization will fail"
     fi
 else
-    log_warn "No HuggingFace token provided — set HF_TOKEN env var before first pipeline run"
+    log_warn "No HuggingFace token provided — diarization will be disabled at runtime"
 fi
-
-# ── Optional API keys for cloud backends (Gemini, DashScope) ──────────────────
-prompt_optional_key() {
-    local var="$1" service="$2" url="$3"
-    local current="${!var:-}"
-    if [[ -n "$current" ]]; then
-        log_success "$var already set — skipping prompt"
-        return
-    fi
-    echo ""
-    echo -e "${YELLOW}${service} (optional).${NC}  Get a key at:  $url"
-    read -rp "  Enter $var (or press Enter to skip): " value
-    echo ""
-    value=$(echo "$value" | LC_ALL=C tr -cd 'A-Za-z0-9_.-')
-    if [[ -n "$value" ]]; then
-        export "$var=$value"
-        grep -q "^$var=" /workspace/.env 2>/dev/null \
-            || echo "$var=\"$value\"" >> /workspace/.env
-        log_success "$var saved to /workspace/.env"
-    else
-        log_warn "No $var provided — $service backends will prompt at first run"
-    fi
-}
-
-prompt_optional_key GEMINI_API_KEY   "Gemini (translation + Gemini-TTS)" \
-    "https://aistudio.google.com/app/apikey"
-prompt_optional_key DASHSCOPE_API_KEY "DashScope (Qwen3-TTS)" \
-    "https://dashscope.console.aliyun.com/apiKey"
 
 # ── Step 13: Pre-download Whisper large-v3 ────────────────────────────────
 
@@ -452,7 +360,7 @@ else
     log_warn "Whisper download failed — it will auto-download on first use"
 fi
 
-# ── Step 14: Pre-download VoxCPM2 (~4 GB) and EuroLLM tokenizer ──────────────
+# ── Step 14: Pre-download VoxCPM2 (~4 GB) ────────────────────────────────────
 
 log_step "Pre-downloading VoxCPM2 model (~4 GB) …"
 
@@ -474,89 +382,14 @@ else
     log_warn "VoxCPM2 pre-download failed — it will download on first use"
 fi
 
-log_step "Pre-downloading EuroLLM-9B tokenizer …"
-
-if $PYTHON - <<'PYEOF' 2>&1 | tee -a "$LOGFILE"; then
-try:
-    from transformers import AutoTokenizer
-    print("Caching EuroLLM tokenizer …")
-    AutoTokenizer.from_pretrained("utter-project/EuroLLM-9B-Instruct")
-    print("✓ EuroLLM tokenizer cached (weights download on first translate run)")
-except Exception as e:
-    print(f"EuroLLM tokenizer download error: {e}")
-    raise
-PYEOF
-    log_success "EuroLLM tokenizer cached"
-else
-    log_warn "EuroLLM tokenizer pre-download failed — will download on first run"
-fi
-
-# ── Step 14b: Pre-download XTTS v2 fallback (~2 GB) ──────────────────────────
-
-log_step "Pre-downloading XTTS v2 fallback (~2 GB) …"
-
-if [[ $TTS_INSTALLED -eq 0 ]]; then
-    log_warn "Skipping XTTS v2 download — TTS package not installed"
-elif COQUI_TOS_AGREED=1 $PYTHON - <<'PYEOF' 2>&1 | tee -a "$LOGFILE"; then
-import os, importlib
-os.environ["COQUI_TOS_AGREED"] = "1"
-
-import torch
-from packaging.version import Version as _V
-
-# Patch all symbols removed from transformers in 4.41+ that coqui-tts still imports
-def _patch():
-    # transformers.pytorch_utils.isin_mps_friendly
-    try:
-        m = importlib.import_module("transformers.pytorch_utils")
-        if not hasattr(m, "isin_mps_friendly"):
-            m.isin_mps_friendly = torch.isin
-            print("Patched: transformers.pytorch_utils.isin_mps_friendly")
-    except Exception as e:
-        print(f"  skip pytorch_utils patch: {e}")
-
-    # transformers.utils.import_utils.is_torch_greater_or_equal
-    try:
-        m = importlib.import_module("transformers.utils.import_utils")
-        if not hasattr(m, "is_torch_greater_or_equal"):
-            def _gte(version, revision=None):
-                v = f"{version}.{revision}" if revision else version
-                return _V(torch.__version__.split("+")[0]) >= _V(v)
-            m.is_torch_greater_or_equal = _gte
-            tu = importlib.import_module("transformers.utils")
-            if not hasattr(tu, "is_torch_greater_or_equal"):
-                tu.is_torch_greater_or_equal = _gte
-            print("Patched: transformers.utils.import_utils.is_torch_greater_or_equal")
-    except Exception as e:
-        print(f"  skip import_utils patch: {e}")
-
-_patch()
-
-try:
-    from TTS.api import TTS
-    print("Downloading XTTS v2 …")
-    tts = TTS("tts_models/multilingual/multi-dataset/xtts_v2", gpu=False)
-    del tts
-    print("✓ XTTS v2 cached")
-except Exception as e:
-    print(f"XTTS download error: {e}")
-    raise
-PYEOF
-    log_success "XTTS v2 cached"
-else
-    log_warn "XTTS v2 download failed — it will auto-download on first use"
-fi
-
-# ── Step 14c: Upgrade non-pinned packages to latest ───────────────────────────
-# Pulls newest releases of everything that doesn't have an upper bound. Run
-# AFTER all installs (so transitive deps settle) and BEFORE the numpy pin (so
-# the pin still wins). Refreshes Ollama tag too.
+# ── Step 14b: Refresh latest releases for non-pinned packages ────────────────
+# Pulls newest releases of packages without an upper bound. Run after all
+# installs (so transitive deps settle).
 
 log_step "Upgrading non-pinned packages to latest …"
 
 $PYTHON -m pip install --upgrade --no-cache-dir \
-       faster-whisper transformers accelerate bitsandbytes voxcpm whisperx \
-       google-genai edge-tts dashscope qwen-tts deepfilternet noisereduce \
+       faster-whisper voxcpm pyannote.audio deepfilternet noisereduce \
        2>&1 | tail -5 | tee -a "$LOGFILE" \
     && log_success "Packages upgraded" \
     || log_warn "Upgrade pass had non-fatal issues — pipeline still usable"
@@ -564,16 +397,6 @@ $PYTHON -m pip install --upgrade --no-cache-dir \
 if curl -s http://localhost:11434/api/tags > /dev/null 2>&1; then
     ollama pull qwen3:14b 2>&1 | tail -3 | tee -a "$LOGFILE" || true
 fi
-
-# ── Step 15: Pin numpy (must run LAST — coqui-tts dep chain upgrades it) ──
-
-log_step "Force-pinning numpy<2.0.0 (coqui-tts compatibility) …"
-# coqui-tts pulls numpy 2.x as a transitive dep; force it back after everything
-# else is installed so it wins regardless of dep resolution order.
-$PYTHON -m pip install --no-cache-dir --force-reinstall "numpy>=1.26.4,<2.0.0" \
-    2>&1 | tail -3 | tee -a "$LOGFILE" \
-    && log_success "numpy pinned to 1.26.x" \
-    || log_warn "numpy pin failed — coqui-tts audio ops may behave unexpectedly"
 
 # ── Step 16: Install scripts & config ─────────────────────────────────────
 
