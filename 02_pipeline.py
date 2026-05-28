@@ -18,6 +18,7 @@ Stack (single, fixed path):
 """
 
 import gc
+import json
 import logging
 import os
 import re
@@ -143,6 +144,9 @@ class PipelineConfig:
 
     timeout_seconds: int = 7200
 
+    # Debug — keep all temp files and dump intermediate segment JSON
+    keep_temp: bool = False
+
 
 @dataclass
 class GlossaryEntry:
@@ -221,6 +225,7 @@ def load_config(path: str) -> PipelineConfig:
         synthesis_sample_rate=aud.get("synthesis_sample_rate", 48000),
         output_sample_rate=aud.get("output_sample_rate", 48000),
         timeout_seconds=proc.get("timeout_seconds", 7200),
+        keep_temp=bool(proc.get("keep_temp", False)),
     )
 
 
@@ -1613,6 +1618,17 @@ def create_srt(
 # Main Pipeline
 # ============================================================================
 
+def _dump_segments(segments: List[dict], temp_dir: str, label: str, log: logging.Logger) -> None:
+    """Write segments to a numbered JSON file for post-run inspection."""
+    path = os.path.join(temp_dir, f"segments_{label}.json")
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(segments, f, ensure_ascii=False, indent=2)
+        log.debug(f"[keep_temp] {len(segments)} segments → {Path(path).name}")
+    except Exception as e:
+        log.warning(f"Could not write debug dump {path}: {e}")
+
+
 def process_video(
     video_path: str,
     output_dir: str,
@@ -1688,7 +1704,13 @@ def process_video(
         return False
     free_vram(log)
 
+    if config.keep_temp:
+        _dump_segments(segments, temp_dir, "01_whisper_raw", log)
+
     segments = dedupe_whisper_segments(segments, log)
+
+    if config.keep_temp:
+        _dump_segments(segments, temp_dir, "02_deduped", log)
 
     segments = merge_segments(
         segments,
@@ -1697,6 +1719,9 @@ def process_video(
         min_duration=config.segment_merge_min_duration,
         log=log,
     )
+
+    if config.keep_temp:
+        _dump_segments(segments, temp_dir, "03_merged", log)
 
     # Optional diarization.
     diarization_turns: Optional[List[Tuple[float, float, str]]] = None
@@ -1718,6 +1743,8 @@ def process_video(
                 speaker_counts[spk] = speaker_counts.get(spk, 0) + 1
             for spk, n in sorted(speaker_counts.items()):
                 log.info(f"  {spk}: {n} segment(s)")
+            if config.keep_temp:
+                _dump_segments(segments, temp_dir, "04_diarized", log)
         else:
             log.warning("  Diarization failed — all segments assigned to SPEAKER_00")
             for seg in segments:
@@ -1736,6 +1763,9 @@ def process_video(
     )
     _verify_translation_quality(segments, log)
 
+    if config.keep_temp:
+        _dump_segments(segments, temp_dir, "05_translated", log)
+
     if config.translation_review:
         log.info(f"\n[3b/6] REVIEWING TRANSLATIONS ({config.translation_model})")
         segments = review_translations(
@@ -1748,10 +1778,14 @@ def process_video(
             locale=config.locale,
             glossary_section=glossary_section,
         )
+        if config.keep_temp:
+            _dump_segments(segments, temp_dir, "06_reviewed", log)
 
     if glossary.entries:
         log.info("\n[3c/6] APPLYING GLOSSARY (deterministic substitution)")
         segments = apply_glossary(segments, glossary.entries, log)
+        if config.keep_temp:
+            _dump_segments(segments, temp_dir, "07_glossary", log)
 
     # ── 4. Speaker reference(s) ─────────────────────────────────────────────
     log.info("\n[4/6] PREPARING SPEAKER REFERENCE(S)")
@@ -1841,9 +1875,16 @@ def process_video(
     srt_segments = retime_segments_to_audio(
         segments, synthesized, actual_sr, total_duration, log
     )
+
+    if config.keep_temp:
+        _dump_segments(srt_segments, temp_dir, "08_retimed", log)
+
     create_srt(srt_segments, final_srt, log, offset_ms=config.subtitle_offset_ms)
 
-    shutil.rmtree(temp_dir, ignore_errors=True)
+    if config.keep_temp:
+        log.info(f"  [keep_temp] Temp files preserved at: {temp_dir}")
+    else:
+        shutil.rmtree(temp_dir, ignore_errors=True)
 
     log.info(f"\n{'=' * 60}")
     log.info(f"DONE: {name}")
@@ -1875,6 +1916,12 @@ def process_video(
     default=None,
     help="Boost output loudness by this percent (e.g. 20 → +20%). 0 = off.",
 )
+@click.option(
+    "--keep-temp",
+    is_flag=True,
+    default=False,
+    help="Keep all temp files and dump intermediate segment JSON for debugging.",
+)
 def main(
     video: str,
     output_dir: str,
@@ -1882,6 +1929,7 @@ def main(
     force: bool,
     locale: Optional[str],
     volume_boost: Optional[float],
+    keep_temp: bool,
 ) -> None:
     """Dub a video to French (audio track + SRT subtitles).
 
@@ -1897,6 +1945,8 @@ def main(
         config.locale = locale.lower()
     if volume_boost is not None:
         config.output_volume_boost_pct = float(volume_boost)
+    if keep_temp:
+        config.keep_temp = True
     log     = setup_logging(config.logs_folder, Path(video).stem)
     success = process_video(video, output_dir, config, log, force=force)
     sys.exit(0 if success else 1)

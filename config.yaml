@@ -154,3 +154,7 @@ subtitles:
 processing:
   max_workers: 1       # keep at 1 — models share 24 GB VRAM
   timeout_seconds: 7200
+  # Set to true to skip temp-dir cleanup and dump intermediate segment JSON files.
+  # Useful for inspecting what each pipeline stage produces (transcription, merge,
+  # translation, etc.). Files land in temp_folder/<video-stem>/segments_NN_*.json.
+  keep_temp: false
