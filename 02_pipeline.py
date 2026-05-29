@@ -1306,8 +1306,30 @@ def synthesize_all_segments(
 # Step 7: Audio Assembly + Encoding + Background Re-mix
 # ============================================================================
 
-_CROSSFADE_MS = 50.0
-_FADE_OUT_MS  = 80.0
+_CROSSFADE_MS = 120.0
+_FADE_OUT_MS  = 100.0
+_FADE_IN_MS   = 30.0
+
+
+def _trim_silence(audio: np.ndarray, top_db: int = 30) -> np.ndarray:
+    """Remove leading and trailing silence from synthesized audio."""
+    try:
+        # librosa.effects.trim returns (trimmed_audio, index)
+        trimmed, _ = librosa.effects.trim(audio, top_db=top_db)
+        return trimmed
+    except Exception:
+        return audio
+
+
+def _apply_fade_in(audio: np.ndarray, fade_samples: int) -> np.ndarray:
+    n = min(fade_samples, len(audio))
+    if n <= 0:
+        return audio
+    out = audio.copy()
+    # Cosine fade-in ramp
+    ramp = 0.5 * (1.0 - np.cos(np.linspace(0, np.pi, n, dtype=np.float32)))
+    out[:n] *= ramp
+    return out
 
 
 def _atempo_stretch(
@@ -1365,7 +1387,8 @@ def _equal_power_crossfade(buf: np.ndarray, start: int, new_audio: np.ndarray, x
 
     xfade = max(0, min(xfade_samples, n))
     existing = buf[start : start + xfade]
-    has_overlap = xfade > 0 and float(np.max(np.abs(existing))) > 1e-4
+    # Relaxed overlap check: if any signal exists in the buffer, crossfade it.
+    has_overlap = xfade > 0 and float(np.max(np.abs(existing))) > 1e-6
 
     if has_overlap:
         t       = np.linspace(0, 1, xfade, dtype=np.float32)
@@ -1409,12 +1432,20 @@ def assemble_and_encode(
     ordered       = sorted(synthesized, key=lambda x: x[1])
 
     xfade_samples = int(_CROSSFADE_MS / 1000.0 * src_rate)
-    fade_samples  = int(_FADE_OUT_MS / 1000.0 * src_rate)
+    fade_in_samples = int(_FADE_IN_MS / 1000.0 * src_rate)
+    fade_out_samples = int(_FADE_OUT_MS / 1000.0 * src_rate)
 
     stretched_count = 0
     truncated_count = 0
 
     for i, (audio, start, end) in enumerate(ordered):
+        # 1. Clean the synthesized audio
+        audio = _trim_silence(audio)
+        
+        # 2. Apply micro-fades to prevent sharp cuts
+        audio = _apply_fade_in(audio, fade_in_samples)
+        audio = _apply_fade_out(audio, fade_in_samples) # Use fade_in_samples for symmetric micro-fade
+
         start_s  = int(start * src_rate)
         window_s = int((end - start) * src_rate)
 
@@ -1430,7 +1461,8 @@ def assemble_and_encode(
                 audio = _atempo_stretch(audio, available, src_rate, max_stretch, temp_dir, log)
                 stretched_count += 1
             else:
-                audio = _apply_fade_out(audio[:available], fade_samples)
+                # If we truncate, apply a longer fade-out
+                audio = _apply_fade_out(audio[:available], fade_out_samples)
                 truncated_count += 1
                 log.debug(
                     f"  segment {i}: truncated ({ratio:.2f}× over budget, "
