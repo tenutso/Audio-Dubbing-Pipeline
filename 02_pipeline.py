@@ -882,11 +882,15 @@ You are a professional {language} dubbing translator.
 Translate each numbered English segment into natural, conversational {language}
 suitable for a dubbed voice-over.
 
+Each segment includes its duration in seconds [N.Ns].
+Your translation MUST be concise enough to be spoken naturally within that time.
+Aim for approximately 15-18 characters per second of duration.
+
 RULES:
 - Preserve key technical terms and proper nouns.
 - Adapt idioms naturally; do not translate literally.
 - Use a spoken register (contractions, common phrasing) — not literary French.
-- Keep approximately the same length as the source so the dub fits the timing.
+- If the translation is significantly longer than the original, SHORTEN IT.
 - Output ONLY the numbered translations, one per line, same numbering as input.
 - Do NOT add character counts, parentheticals, notes, brackets, or explanations.
 {glossary_section}
@@ -898,7 +902,9 @@ English segments:
 _REVIEW_PROMPT = """\
 You are a native {language} editor reviewing dubbed video subtitles.{locale_note}
 Correct unnatural phrasing, Anglicisms, grammar errors, and register slips.
-Keep changes minimal — only fix what is actually wrong.
+
+Each segment includes its duration in seconds [N.Ns].
+Ensure the corrected text remains concise enough to fit the timing.
 
 - Output only the corrected numbered list, same numbering as input.
 - Do NOT add character counts, parentheticals, notes, brackets, or explanations.
@@ -1037,7 +1043,10 @@ def translate_segments_qwen(
     def _translate(items: List[dict]) -> List[str]:
         if not items:
             return []
-        numbered = "\n".join(f"{i + 1}. {s['text']}" for i, s in enumerate(items))
+        numbered = "\n".join(
+            f"{i + 1}. [{s['end'] - s['start']:.1f}s] {s['text']}" 
+            for i, s in enumerate(items)
+        )
         prompt = think_prefix + _TRANSLATE_PROMPT.format(
             language=language, segments=numbered, glossary_section=glossary_section
         )
@@ -1097,7 +1106,10 @@ def review_translations(
 
     for start in tqdm(range(0, len(segments), batch_size), desc=f"Reviewing ({target_lang})"):
         batch    = segments[start : start + batch_size]
-        numbered = "\n".join(f"{i + 1}. {s.get('text_fr', '')}" for i, s in enumerate(batch))
+        numbered = "\n".join(
+            f"{i + 1}. [{s['end'] - s['start']:.1f}s] {s.get('text_fr', '')}" 
+            for i, s in enumerate(batch)
+        )
         prompt = think_prefix + _REVIEW_PROMPT.format(
             language=language,
             segments=numbered,
@@ -1472,13 +1484,23 @@ def remix_with_background(
     bg_gain_db: float = -3.0,
     volume_boost_pct: float = 0.0,
 ) -> bool:
-    """Mix French vocals with the original background at -3 dB."""
-    log.info("Re-mixing French vocals with original background …")
+    """Mix French vocals with original background using sidechain ducking.
+
+    Vocal Chain: highpass (80Hz) + compand (normalize)
+    Background Chain: sidechaincompress (ducked by vocals)
+    """
+    log.info("Re-mixing French vocals with sidechain auto-ducking …")
     voice_gain = 1.0 + (volume_boost_pct or 0.0) / 100.0
+
+    # sidechaincompress:
+    #   threshold: level above which compression starts (0.1)
+    #   ratio: how much to reduce bg (20:1)
+    #   attack/release: timing of ducking (10ms / 200ms)
     filt = (
-        f"[0:a]volume={voice_gain:.3f}[v];"
-        f"[1:a]volume={bg_gain_db}dB[bg];"
-        "[v][bg]amix=inputs=2:duration=first[out]"
+        f"[0:a]highpass=f=80,compand,volume={voice_gain:.3f}[v];"
+        f"[1:a]volume={bg_gain_db}dB[bg_pre];"
+        "[bg_pre][v]sidechaincompress=threshold=0.1:ratio=20:attack=10:release=200[bg_ducked];"
+        "[v][bg_ducked]amix=inputs=2:duration=first:dropout_transition=0[out]"
     )
     try:
         subprocess.run(
@@ -1494,7 +1516,7 @@ def remix_with_background(
             ],
             check=True, capture_output=True, timeout=600,
         )
-        log.info(f"✓ Background re-mixed: {os.path.getsize(output_aac) / 1e6:.1f} MB")
+        log.info(f"✓ Background re-mixed (auto-ducked): {os.path.getsize(output_aac) / 1e6:.1f} MB")
         return True
     except Exception as e:
         log.error(f"Background re-mix failed: {e}")
@@ -1592,14 +1614,26 @@ def create_srt(
 
     Pick text from: seg["text_fr"] → seg["text"] (English fallback).
     Enforces a 1 s minimum entry duration so subtitles don't flash by.
+    Includes a CPS (Characters Per Second) check.
     """
     try:
         offset_s = offset_ms / 1000.0
         subs     = pysrt.SubRipFile()
+        high_cps_count = 0
+
         for idx, seg in enumerate(segments, 1):
             text  = _wrap_subtitle(seg.get("text_fr") or seg["text"])
             start = max(0.0, seg["start"] + offset_s)
             end   = max(start + 1.0, seg["end"] + offset_s)
+            
+            # CPS Check
+            dur = end - start
+            if dur > 0:
+                cps = len(text) / dur
+                if cps > 20:
+                    high_cps_count += 1
+                    log.debug(f"  High CPS ({cps:.1f}) at index {idx}: '{text[:30]}...'")
+
             subs.append(SubRipItem(
                 index=idx,
                 start=SubRipTime(seconds=start),
@@ -1608,6 +1642,8 @@ def create_srt(
             ))
         subs.save(output_path, encoding="utf-8")
         log.info(f"✓ SRT: {len(subs)} entries" + (f" (offset {offset_ms:+d} ms)" if offset_ms else ""))
+        if high_cps_count > 0:
+            log.warning(f"  {high_cps_count} subtitle(s) exceed 20 CPS (Characters Per Second).")
         return True
     except Exception as e:
         log.error(f"SRT creation failed: {e}")

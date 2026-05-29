@@ -93,7 +93,7 @@ translation:
   # "fr-ca" → Canadian / Québécois French — loads canadian_glossary.yaml
   #           and applies prompt injection + 'always'-mode substitution.
   # Override at runtime with: --locale fr-ca
-  locale: fr
+  locale: fr-ca
   glossary_path: /workspace/canadian_glossary.yaml
 
   # HuggingFace token — only used by the diarization gated model.
@@ -157,4 +157,4 @@ processing:
   # Set to true to skip temp-dir cleanup and dump intermediate segment JSON files.
   # Useful for inspecting what each pipeline stage produces (transcription, merge,
   # translation, etc.). Files land in temp_folder/<video-stem>/segments_NN_*.json.
-  keep_temp: false
+  keep_temp: true
